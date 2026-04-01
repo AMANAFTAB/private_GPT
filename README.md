@@ -16,3 +16,5 @@ A private AI chat application built with Streamlit that allows users to:
 - Firebase Realtime Database
 - FAISS Vector Search
 ```
+##Deployment
+- Deployed on streamlit community cloud. URL: https://ampvtgpt.streamlit.app/
