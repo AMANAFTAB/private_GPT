@@ -15,6 +15,7 @@ A private AI chat application built with Streamlit that allows users to:
 - Azure AI (Llama 4 Maverick + Ada Embeddings)
 - Firebase Realtime Database
 - FAISS Vector Search
-```
+
 ##Deployment
 - Deployed on streamlit community cloud. URL: https://ampvtgpt.streamlit.app/
+```
