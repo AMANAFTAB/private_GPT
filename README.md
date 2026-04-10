@@ -17,5 +17,5 @@ A private AI chat application built with Streamlit that allows users to:
 - FAISS Vector Search
 
 ## Deployment
-- Deployed on streamlit community cloud. URL: https://ampvtgpt.streamlit.app/
+- Deployed on streamlit community cloud. URL: https://am-intelligence.streamlit.app/
 ```
