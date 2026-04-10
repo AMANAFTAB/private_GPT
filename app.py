@@ -588,7 +588,7 @@ def load_room_files_into_state(code: str):
 # ══════════════════════════════════════════════════════════════════════
 
 with st.sidebar:
-    st.title("🔒 PrivateGPT")
+    st.title("🔒 AM Intelligence")
     st.divider()
 
     # ── UNAUTHENTICATED ──────────────────────────────────────────────
@@ -856,7 +856,7 @@ mode = st.session_state["mode"]
 # ── PRIVATE CHAT ─────────────────────────────────────────────────────
 if mode == "private":
 
-    st.header("🔒 PrivateGPT")
+    st.header("🔒 AM Intelligence")
 
     if not st.session_state["authenticated"]:
         st.caption("💡 Log in from the sidebar to upload files and save sessions.")
@@ -1005,7 +1005,7 @@ elif mode == "room":
                 except Exception as e:
                     response = f"⚠️ Error getting response: {str(e)}"
 
-            send_room_message(code, "PrivateGPT", response, is_bot=True)
+            send_room_message(code, "AM Intelligence", response, is_bot=True)
 
             st.session_state["room_thinking"] = False
             st.rerun()
