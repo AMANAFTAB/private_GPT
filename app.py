@@ -22,7 +22,7 @@ from streamlit_autorefresh import st_autorefresh
 # PAGE CONFIG
 # ══════════════════════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="PrivateGPT",
+    page_title="AM Intelligence",
     page_icon="🔒",
     layout="wide",
 )
