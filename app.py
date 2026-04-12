@@ -36,7 +36,7 @@ AZURE_ENDPOINT       = st.secrets["MODELS_ENDPOINT"]
 AZURE_API_KEY        = st.secrets["LLM_API_KEY"]
 AZURE_API_VERSION    = "2025-04-01-preview"
 LLM_DEPLOYMENT       = "Llama-4-Maverick-17B-128E-Instruct-FP8"
-EMBEDDING_DEPLOYMENT = "text-embedding-ada-002"
+EMBEDDING_DEPLOYMENT = "embed-v-4-0"
 
 # ══════════════════════════════════════════════════════════════════════
 # FIREBASE Authentication
