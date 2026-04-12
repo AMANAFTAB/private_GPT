@@ -12,7 +12,7 @@ A private AI chat application built with Streamlit that allows users to:
 
 ## Tech Stack
 - Streamlit
-- Azure AI (Llama 4 Maverick + Ada Embeddings)
+- Azure AI (Llama 4 Maverick + embed-v-4-0 Embeddings)
 - Firebase Realtime Database
 - FAISS Vector Search
 
