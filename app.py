@@ -29,8 +29,7 @@ st.set_page_config(
 
 # ══════════════════════════════════════════════════════════════════════
 # AZURE Authentication
-# All models share the same endpoint/key since they are deployed
-# under the same Azure AI Foundry resource.
+# All models share the same endpoint/key since they are deployed under the same Azure AI Foundry resource.
 # ══════════════════════════════════════════════════════════════════════
 AZURE_ENDPOINT       = st.secrets["MODELS_ENDPOINT"]
 AZURE_API_KEY        = st.secrets["LLM_API_KEY"]
@@ -150,7 +149,13 @@ embeddings   = load_embeddings(azure_client)
 # 0.85 → open chat     (natural, conversational)
 # ══════════════════════════════════════════════════════════════════════
 def ask_llm(prompt: str, has_context: bool = False,
-            images: list = None) -> str:
+            images: list = None, history: list = None) -> str:
+    """
+    FIX – Azure AI Foundry gateway does not support the 'system' role.
+    System instructions are injected into the first user turn instead.
+    The optional `history` list ({"role", "content"} dicts) gives the LLM
+    conversational memory across turns.
+    """
     system_prompt = (
         "You are a helpful assistant. "
         "When document context is provided, answer based on it and always "
@@ -158,22 +163,32 @@ def ask_llm(prompt: str, has_context: bool = False,
         "When no context is provided, answer normally using your own knowledge."
     )
 
+    messages = []
+    injected = False
+
+    # Replay history, injecting the system prompt into the very first user turn
+    for turn in (history or []):
+        if turn["role"] == "user" and not injected:
+            messages.append({
+                "role":    "user",
+                "content": f"[System: {system_prompt}]\n\n{turn['content']}",
+            })
+            injected = True
+        else:
+            messages.append({"role": turn["role"], "content": turn["content"]})
+
+    # Current user turn
+    current_text = prompt if injected else f"[System: {system_prompt}]\n\n{prompt}"
     if images:
-        content = [{"type": "text", "text": prompt}]
+        content = [{"type": "text", "text": current_text}]
         for img_b64 in images:
             content.append({
                 "type": "image_url",
                 "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
             })
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": content},
-        ]
+        messages.append({"role": "user", "content": content})
     else:
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": prompt},
-        ]
+        messages.append({"role": "user", "content": current_text})
 
     response = azure_client.chat.completions.create(
         model=LLM_DEPLOYMENT,
@@ -184,11 +199,12 @@ def ask_llm(prompt: str, has_context: bool = False,
     return response.choices[0].message.content
 
 
-def build_response(user_question: str) -> str:
+def build_response(user_question: str, history: list = None) -> str:
     """
     Build context from selected files and return LLM answer.
     In room mode, uses room_selected_files.
     In private mode, uses selected_files.
+    FIX: passes history so the LLM has conversational memory.
     """
     # Use room selection if in room mode, else private selection
     if st.session_state["mode"] == "room":
@@ -204,7 +220,7 @@ def build_response(user_question: str) -> str:
     imgs_b64 = [image_files[f] for f in sel_imgs]
 
     if not sel_text and not sel_imgs:
-        return ask_llm(user_question, has_context=False)
+        return ask_llm(user_question, has_context=False, history=history)
 
     context = ""
     if sel_text:
@@ -237,7 +253,7 @@ def build_response(user_question: str) -> str:
             f"Question: {user_question}\n\nAnswer:"
         )
 
-    return ask_llm(prompt, has_context=True, images=imgs_b64 or None)
+    return ask_llm(prompt, has_context=True, images=imgs_b64 or None, history=history)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -334,13 +350,15 @@ def process_uploaded_file(uploaded_file, index_dir: str,
         elif mode == "room" and room_code:
             _add_file_to_room_db(room_code, fname, "image")
 
-    # Update both selection lists
+    # FIX: Only touch room_selected_files when actually in room mode,
+    # so a private upload never clobbers the room's file selection.
     all_files = (
         list(st.session_state["pdf_stores"].keys()) +
         list(st.session_state["image_files"].keys())
     )
-    st.session_state["selected_files"]      = all_files
-    st.session_state["room_selected_files"] = all_files
+    st.session_state["selected_files"] = all_files
+    if mode == "room":
+        st.session_state["room_selected_files"] = all_files
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -483,6 +501,7 @@ def get_room_messages(code: str) -> list:
             )
     except Exception as e:
         st.warning(f"{e}")
+    return []
 
 def send_room_message(code: str, user: str, content: str,
                       is_bot: bool = False, is_system: bool = False):
@@ -509,6 +528,26 @@ def get_room_files(code: str) -> list:
         return []
     except:
         return []
+
+def _room_history_for_llm(code: str) -> list:
+    """
+    FIX (room memory): Read Firebase room messages, strip system notifications,
+    and return a list of {"role", "content"} dicts for the LLM history param.
+    """
+    try:
+        raw = get_room_messages(code)
+    except Exception:
+        return []
+    history = []
+    for _, msg in raw:
+        if msg.get("is_system"):
+            continue
+        role = "assistant" if msg.get("is_bot") else "user"
+        content = msg.get("content", "")
+        if content:
+            history.append({"role": role, "content": content})
+    return history
+
 
 def _add_file_to_room_db(code: str, filename: str, filetype: str):
     safe_key = _safe_firebase_key(filename)
@@ -871,7 +910,8 @@ if mode == "private":
             with st.chat_message("user"):
                 st.write(user_q)
             with st.spinner("Thinking…"):
-                response = ask_llm(user_q, has_context=False)
+                response = ask_llm(user_q, has_context=False,
+                                   history=st.session_state["chat_history"])
             with st.chat_message("assistant"):
                 st.write(response)
             st.session_state["chat_history"].append({"role": "user",      "content": user_q})
@@ -890,7 +930,8 @@ if mode == "private":
             with st.chat_message("user"):
                 st.write(user_q)
             with st.spinner("Thinking…"):
-                response = ask_llm(user_q, has_context=False)
+                response = ask_llm(user_q, has_context=False,
+                                   history=st.session_state["chat_history"])
             with st.chat_message("assistant"):
                 st.write(response)
             st.session_state["chat_history"].append({"role": "user",      "content": user_q})
@@ -918,7 +959,7 @@ if mode == "private":
             with st.chat_message("user"):
                 st.write(user_q)
             with st.spinner("Thinking…"):
-                response = build_response(user_q)
+                response = build_response(user_q, history=st.session_state["chat_history"])
             with st.chat_message("assistant"):
                 st.write(response)
             st.session_state["chat_history"].append({"role": "user",      "content": user_q})
@@ -937,6 +978,15 @@ elif mode == "room":
             st.info("Enter a room code in the sidebar to join.")
 
     else:
+        # ── GHOST-RESPONSE FIX ─────────────────────────────────────────
+        # Read the chat input FIRST and immediately set room_thinking=True
+        # so that st_autorefresh is never armed in the same render as an
+        # active LLM call. Previously the autorefresh timer could fire
+        # mid-call, silently killing it and producing no bot response.
+        user_q = st.chat_input("Ask the room…")
+        if user_q:
+            st.session_state["room_thinking"] = True
+
         # Pause auto-refresh while LLM is thinking so call isn't killed
         if not st.session_state.get("room_thinking", False):
             st_autorefresh(interval=15000, key="room_refresh")
@@ -989,19 +1039,17 @@ elif mode == "room":
                         )
                     st.write(msg.get("content", ""))
 
-        # Chat input — available to ALL users in the room
-        user_q = st.chat_input("Ask the room…")
+        # Chat input already read above — send message and get LLM response
         if user_q:
-            # Pause auto-refresh so LLM call completes uninterrupted
-            st.session_state["room_thinking"] = True
-
             send_room_message(
                 code, st.session_state["username"], user_q, is_bot=False
             )
 
             with st.spinner("Thinking…"):
                 try:
-                    response = build_response(user_q)
+                    # FIX: pass room history so LLM has conversational memory
+                    room_hist = _room_history_for_llm(code)
+                    response  = build_response(user_q, history=room_hist)
                 except Exception as e:
                     response = f"⚠️ Error getting response: {str(e)}"
 
