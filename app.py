@@ -11,10 +11,12 @@ from PyPDF2 import PdfReader
 from docx import Document as DocxDocument
 from PIL import Image
 import io
+import re
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
-from openai import AzureOpenAI
+from openai import AzureOpenAI, BadRequestError
 import pyrebase
 from streamlit_autorefresh import st_autorefresh
 
@@ -36,6 +38,16 @@ AZURE_API_KEY        = st.secrets["LLM_API_KEY"]
 AZURE_API_VERSION    = "2025-04-01-preview"
 LLM_DEPLOYMENT       = "Llama-4-Maverick-17B-128E-Instruct-FP8"
 EMBEDDING_DEPLOYMENT = "embed-v-4-0"
+EMBEDDING_BATCH_SIZE = 96
+MAX_UPLOAD_MB        = 20
+MAX_UPLOAD_BYTES     = MAX_UPLOAD_MB * 1024 * 1024
+PAGE_QUERY_RE        = re.compile(
+    r"\bpage(?:\s+number|\s+no\.?)?\s+(\d+)\b", re.IGNORECASE
+)
+SECTION_TITLE_RE     = re.compile(
+    r'\bsection\s+[\"“”\']([^\"“”\']+)[\"“”\']', re.IGNORECASE
+)
+SECTION_FOLLOWUP_RE  = re.compile(r"\b(that|this|the)\s+section\b", re.IGNORECASE)
 
 # ══════════════════════════════════════════════════════════════════════
 # FIREBASE Authentication
@@ -81,6 +93,9 @@ DEFAULTS = {
     "chat_history":       [],
     "room_thinking":      False,
     "room_selected_files": [],   # tracks file selection specifically for rooms
+    "private_upload_sig": None,
+    "room_upload_sig":    None,
+    "room_unavailable_files": [],
 }
 for key, val in DEFAULTS.items():
     if key not in st.session_state:
@@ -91,10 +106,10 @@ for key, val in DEFAULTS.items():
 # ══════════════════════════════════════════════════════════════════════
 @st.cache_resource
 def init_firebase():
-    firebase = pyrebase.initialize_app(FIREBASE_CONFIG)
-    return firebase.database()
+    return pyrebase.initialize_app(FIREBASE_CONFIG)
 
-db = init_firebase()
+firebase_app = init_firebase()
+db = firebase_app.database()
 
 # ══════════════════════════════════════════════════════════════════════
 # AZURE CLIENTS --> calling the embedding model
@@ -110,10 +125,17 @@ class AzureOpenAIEmbeddings(Embeddings):
         self.deployment = deployment
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        response = self.client.embeddings.create(
-            input=texts, model=self.deployment
-        )
-        return [item.embedding for item in response.data]
+        if not texts:
+            return []
+
+        all_embeddings = []
+        for start in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+            batch = texts[start:start + EMBEDDING_BATCH_SIZE]
+            response = self.client.embeddings.create(
+                input=batch, model=self.deployment
+            )
+            all_embeddings.extend(item.embedding for item in response.data)
+        return all_embeddings
 
     def embed_query(self, text: str) -> list[float]:
         response = self.client.embeddings.create(
@@ -152,33 +174,40 @@ def ask_llm(prompt: str, has_context: bool = False,
             images: list = None, history: list = None) -> str:
     """
     FIX – Azure AI Foundry gateway does not support the 'system' role.
-    System instructions are injected into the first user turn instead.
+    Conversation rules are injected into the first user turn instead.
     The optional `history` list ({"role", "content"} dicts) gives the LLM
     conversational memory across turns.
     """
-    system_prompt = (
-        "You are a helpful assistant. "
-        "When document context is provided, answer based on it and always "
-        "mention which document your answer comes from. "
-        "When no context is provided, answer normally using your own knowledge."
+    conversation_rules = (
+        "Conversation rules:\n"
+        "- Be a helpful assistant.\n"
+        "- If document context is provided, answer from it and mention the "
+        "document it came from.\n"
+        "- If no document context is provided, answer normally using your "
+        "general knowledge."
     )
 
     messages = []
     injected = False
 
-    # Replay history, injecting the system prompt into the very first user turn
+    # Replay history, injecting the conversation rules into the first user turn.
     for turn in (history or []):
         if turn["role"] == "user" and not injected:
             messages.append({
                 "role":    "user",
-                "content": f"[System: {system_prompt}]\n\n{turn['content']}",
+                "content": (
+                    f"{conversation_rules}\n\n"
+                    f"User message:\n{turn['content']}"
+                ),
             })
             injected = True
         else:
             messages.append({"role": turn["role"], "content": turn["content"]})
 
     # Current user turn
-    current_text = prompt if injected else f"[System: {system_prompt}]\n\n{prompt}"
+    current_text = (
+        prompt if injected else f"{conversation_rules}\n\nUser message:\n{prompt}"
+    )
     if images:
         content = [{"type": "text", "text": current_text}]
         for img_b64 in images:
@@ -190,13 +219,159 @@ def ask_llm(prompt: str, has_context: bool = False,
     else:
         messages.append({"role": "user", "content": current_text})
 
-    response = azure_client.chat.completions.create(
-        model=LLM_DEPLOYMENT,
-        messages=messages,
-        max_tokens=1000,
-        temperature=0.4 if has_context else 0.85,
-    )
+    try:
+        response = azure_client.chat.completions.create(
+            model=LLM_DEPLOYMENT,
+            messages=messages,
+            max_tokens=1000,
+            temperature=0.4 if has_context else 0.85,
+        )
+    except BadRequestError as exc:
+        err = getattr(exc, "body", {}) or {}
+        if err.get("error", {}).get("code") != "content_filter":
+            raise
+
+        # False positives can happen when provider filters react to the
+        # injected conversation rules or full replayed history. Retry once
+        # with only the current turn.
+        retry_messages = []
+        if images:
+            retry_content = [{"type": "text", "text": prompt}]
+            for img_b64 in images:
+                retry_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+                })
+            retry_messages.append({"role": "user", "content": retry_content})
+        else:
+            retry_messages.append({"role": "user", "content": prompt})
+
+        try:
+            response = azure_client.chat.completions.create(
+                model=LLM_DEPLOYMENT,
+                messages=retry_messages,
+                max_tokens=1000,
+                temperature=0.4 if has_context else 0.85,
+            )
+        except BadRequestError as retry_exc:
+            retry_err = getattr(retry_exc, "body", {}) or {}
+            if retry_err.get("error", {}).get("code") == "content_filter":
+                return (
+                    "The model provider blocked this prompt under its content "
+                    "filter. This can be a false positive. Please try "
+                    "rephrasing the question slightly and try again."
+                )
+            raise
     return response.choices[0].message.content
+
+
+def _format_context(matches: list[Document]) -> str:
+    blocks = []
+    for match in matches:
+        source = match.metadata.get("source", "unknown")
+        page_number = match.metadata.get("page_number")
+        heading = f"[From: {source}"
+        if page_number is not None:
+            heading += f", page {page_number}"
+        heading += "]"
+        blocks.append(f"{heading}\n{match.page_content}")
+    return "\n\n".join(blocks)
+
+
+def _extract_requested_page(user_question: str):
+    match = PAGE_QUERY_RE.search(user_question)
+    return int(match.group(1)) if match else None
+
+
+def _normalize_lookup_text(text: str) -> str:
+    normalized = text.lower()
+    normalized = normalized.replace("–", "-").replace("—", "-")
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
+
+
+def _extract_explicit_section_title(text: str):
+    match = SECTION_TITLE_RE.search(text)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def _resolve_section_title(user_question: str, history: list = None):
+    explicit = _extract_explicit_section_title(user_question)
+    if explicit:
+        return explicit
+
+    if not SECTION_FOLLOWUP_RE.search(user_question):
+        return None
+
+    for turn in reversed(history or []):
+        if turn.get("role") != "user":
+            continue
+        prior_explicit = _extract_explicit_section_title(turn.get("content", ""))
+        if prior_explicit:
+            return prior_explicit
+    return None
+
+
+def _store_has_page_metadata(store) -> bool:
+    doc_map = getattr(getattr(store, "docstore", None), "_dict", {})
+    return any("page_number" in doc.metadata for doc in doc_map.values())
+
+
+def _get_sorted_store_docs(store, filename: str) -> list[Document]:
+    doc_map = getattr(getattr(store, "docstore", None), "_dict", {})
+    docs = []
+    for doc in doc_map.values():
+        if "source" not in doc.metadata:
+            doc.metadata["source"] = filename
+        docs.append(doc)
+    return sorted(
+        docs,
+        key=lambda doc: (
+            doc.metadata.get("page_number", 10**9),
+            doc.metadata.get("chunk_index", 10**9),
+        )
+    )
+
+
+def _get_page_chunks(store, filename: str, page_number: int) -> list[Document]:
+    matches = []
+    for doc in _get_sorted_store_docs(store, filename):
+        if doc.metadata.get("page_number") != page_number:
+            continue
+        matches.append(doc)
+    return sorted(matches, key=lambda doc: doc.metadata.get("chunk_index", 0))
+
+
+def _find_section_context(store, filename: str, section_title: str) -> list[Document]:
+    docs = _get_sorted_store_docs(store, filename)
+    needle = _normalize_lookup_text(section_title)
+    anchor_index = None
+    for index, doc in enumerate(docs):
+        if needle in _normalize_lookup_text(doc.page_content):
+            anchor_index = index
+            break
+
+    if anchor_index is None:
+        return []
+
+    anchor = docs[anchor_index]
+    anchor_page = anchor.metadata.get("page_number")
+    anchor_chunk = anchor.metadata.get("chunk_index", 0)
+
+    if anchor_page is None:
+        return docs[anchor_index:anchor_index + 6]
+
+    section_docs = []
+    for doc in docs:
+        page_number = doc.metadata.get("page_number")
+        if page_number is None or page_number < anchor_page or page_number > anchor_page + 2:
+            continue
+        if page_number == anchor_page and doc.metadata.get("chunk_index", 0) < anchor_chunk:
+            continue
+        section_docs.append(doc)
+    return section_docs
 
 
 def build_response(user_question: str, history: list = None) -> str:
@@ -206,7 +381,6 @@ def build_response(user_question: str, history: list = None) -> str:
     In private mode, uses selected_files.
     FIX: passes history so the LLM has conversational memory.
     """
-    # Use room selection if in room mode, else private selection
     if st.session_state["mode"] == "room":
         selected = st.session_state["room_selected_files"]
     else:
@@ -222,31 +396,107 @@ def build_response(user_question: str, history: list = None) -> str:
     if not sel_text and not sel_imgs:
         return ask_llm(user_question, has_context=False, history=history)
 
+    requested_page = _extract_requested_page(user_question)
+    section_title = _resolve_section_title(user_question, history=history)
     context = ""
+    direct_page_lookup = False
+    direct_section_lookup = False
+
     if sel_text:
-        all_matches = []
-        for fname in sel_text:
-            matches = pdf_stores[fname].similarity_search(user_question, k=2)
-            for m in matches:
-                m.metadata["source"] = fname
-            all_matches.extend(matches)
-        context = "\n\n".join(
-            f"[From: {m.metadata.get('source', 'unknown')}]\n{m.page_content}"
-            for m in all_matches
-        )
+        if requested_page is not None:
+            page_matches = []
+            page_aware_files = []
+            for fname in sel_text:
+                store = pdf_stores[fname]
+                if not _store_has_page_metadata(store):
+                    continue
+                page_aware_files.append(fname)
+                page_matches.extend(_get_page_chunks(store, fname, requested_page))
+
+            if page_matches:
+                context = _format_context(page_matches)
+                direct_page_lookup = True
+            elif page_aware_files and not sel_imgs:
+                filenames = ", ".join(page_aware_files)
+                return (
+                    f"I could not find indexed text for page {requested_page} in "
+                    f"the selected document(s): {filenames}. Please check the "
+                    f"page number and try again."
+                )
+            elif not page_aware_files and not sel_imgs:
+                return (
+                    "Page-specific lookup is not available for the selected "
+                    "document(s) yet. Please re-upload the PDF so it can be "
+                    "indexed with page numbers."
+                )
+
+        if section_title and not context:
+            section_matches = []
+            for fname in sel_text:
+                section_matches.extend(
+                    _find_section_context(pdf_stores[fname], fname, section_title)
+                )
+            if section_matches:
+                context = _format_context(section_matches)
+                direct_section_lookup = True
+
+        if not context:
+            all_matches = []
+            retrieval_query = user_question
+            if section_title:
+                retrieval_query = f"{section_title}\n{user_question}"
+            for fname in sel_text:
+                matches = pdf_stores[fname].similarity_search(
+                    retrieval_query,
+                    k=4 if section_title else 2
+                )
+                for match in matches:
+                    match.metadata["source"] = fname
+                all_matches.extend(matches)
+            context = _format_context(all_matches)
 
     if context and sel_imgs:
-        prompt = (
-            f"Use the document excerpts AND the provided images to answer.\n\n"
-            f"Document Context:\n{context}\n\n"
-            f"Question: {user_question}\n\nAnswer:"
-        )
+        if direct_page_lookup:
+            prompt = (
+                f"Use the exact excerpts from page {requested_page} AND the "
+                f"provided images to answer.\n\n"
+                f"Document Context:\n{context}\n\n"
+                f"Question: {user_question}\n\nAnswer:"
+            )
+        elif direct_section_lookup:
+            prompt = (
+                f"Use the exact excerpts from the section titled "
+                f"\"{section_title}\" AND the provided images to answer.\n\n"
+                f"Document Context:\n{context}\n\n"
+                f"Question: {user_question}\n\nAnswer:"
+            )
+        else:
+            prompt = (
+                f"Use the document excerpts AND the provided images to answer.\n\n"
+                f"Document Context:\n{context}\n\n"
+                f"Question: {user_question}\n\nAnswer:"
+            )
     elif context:
-        prompt = (
-            f"Use the following document excerpts to answer the question.\n\n"
-            f"Context:\n{context}\n\n"
-            f"Question: {user_question}\n\nAnswer:"
-        )
+        if direct_page_lookup:
+            prompt = (
+                f"Use the following exact excerpts from page {requested_page} to "
+                f"answer the question.\n\n"
+                f"Context:\n{context}\n\n"
+                f"Question: {user_question}\n\nAnswer:"
+            )
+        elif direct_section_lookup:
+            prompt = (
+                f"Use the following exact excerpts from the section titled "
+                f"\"{section_title}\" to answer the question.\n\n"
+                f"Context:\n{context}\n\n"
+                f"Question: {user_question}\n\nAnswer:"
+            )
+        else:
+            prompt = (
+                f"Use the following document excerpts to answer the question.\n\n"
+                f"Context:\n{context}\n\n"
+                f"Question: {user_question}\n\nAnswer:"
+            )
     else:
         prompt = (
             f"Use the provided images to answer the question.\n\n"
@@ -260,15 +510,26 @@ def build_response(user_question: str, history: list = None) -> str:
 # FILE PROCESSING
 # ══════════════════════════════════════════════════════════════════════
 
-def extract_text_from_pdf(f) -> str:
+def extract_pages_from_pdf(f) -> list[Document]:
+    f.seek(0)
     reader = PdfReader(f)
-    return "".join(page.extract_text() or "" for page in reader.pages)
+    page_docs = []
+    for page_number, page in enumerate(reader.pages, start=1):
+        text = page.extract_text() or ""
+        if text.strip():
+            page_docs.append(Document(
+                page_content=text,
+                metadata={"page_number": page_number, "filetype": "pdf"},
+            ))
+    return page_docs
 
 def extract_text_from_docx(f) -> str:
+    f.seek(0)
     doc = DocxDocument(f)
     return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
 
 def image_to_base64(f) -> str:
+    f.seek(0)
     img = Image.open(f)
     if img.mode != "RGB":
         img = img.convert("RGB")
@@ -276,16 +537,28 @@ def image_to_base64(f) -> str:
     img.save(buf, format="JPEG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-def chunk_and_embed(text: str, filename: str, index_dir: str):
-    chunks = RecursiveCharacterTextSplitter(
+def _chunk_documents(documents: list[Document], filename: str) -> list[Document]:
+    splitter = RecursiveCharacterTextSplitter(
         separators=["\n\n", "\n", " "],
         chunk_size=1000,
         chunk_overlap=150,
         length_function=len,
-    ).split_text(text)
+    )
+    chunks = []
+    for document in documents:
+        doc_chunks = splitter.split_text(document.page_content)
+        for chunk_index, chunk in enumerate(doc_chunks):
+            metadata = dict(document.metadata)
+            metadata["source"] = filename
+            metadata["chunk_index"] = chunk_index
+            chunks.append(Document(page_content=chunk, metadata=metadata))
+    return chunks
+
+def chunk_and_embed(documents: list[Document], filename: str, index_dir: str):
+    chunks = _chunk_documents(documents, filename)
     if not chunks:
         return None
-    store     = FAISS.from_texts(chunks, embeddings)
+    store     = FAISS.from_documents(chunks, embeddings)
     save_path = os.path.join(index_dir, filename)
     os.makedirs(save_path, exist_ok=True)
     store.save_local(save_path)
@@ -305,34 +578,65 @@ def process_uploaded_file(uploaded_file, index_dir: str,
                            room_code: str = None):
     fname = uploaded_file.name
     ext   = fname.rsplit(".", 1)[-1].lower()
+    file_size = getattr(uploaded_file, "size", 0)
+
+    if file_size and file_size > MAX_UPLOAD_BYTES:
+        size_mb = file_size / (1024 * 1024)
+        raise ValueError(
+            f"File is {size_mb:.1f} MB. Please upload a file under "
+            f"{MAX_UPLOAD_MB} MB."
+        )
 
     already_loaded = (
         list(st.session_state["pdf_stores"].keys()) +
         list(st.session_state["image_files"].keys())
     )
     if fname in already_loaded:
-        st.info(f"'{fname}' is already loaded!")
-        return
+        existing_store = st.session_state["pdf_stores"].get(fname)
+        if not (ext == "pdf" and existing_store and not _store_has_page_metadata(existing_store)):
+            st.info(f"'{fname}' is already loaded!")
+            return
 
     if ext == "pdf":
-        text  = extract_text_from_pdf(uploaded_file)
-        store = chunk_and_embed(text, fname, index_dir)
+        documents = extract_pages_from_pdf(uploaded_file)
+        if not documents:
+            raise ValueError(
+                "No readable text could be extracted from this PDF. "
+                "If it is a scanned document, OCR would be needed first."
+            )
+        store = chunk_and_embed(documents, fname, index_dir)
         if store:
             st.session_state["pdf_stores"][fname] = store
             if mode == "private" and session_id:
                 _save_file_meta(session_id, fname, "pdf")
             elif mode == "room" and room_code:
                 _add_file_to_room_db(room_code, fname, "pdf")
+                if not _sync_room_file_to_cloud(room_code, fname, "pdf"):
+                    st.warning(
+                        f"{fname} was indexed locally, but shared room sync to "
+                        f"Firebase Storage did not complete."
+                    )
 
     elif ext == "docx":
-        text  = extract_text_from_docx(uploaded_file)
-        store = chunk_and_embed(text, fname, index_dir)
+        text = extract_text_from_docx(uploaded_file)
+        if not text.strip():
+            raise ValueError("No readable text could be extracted from this DOCX.")
+        documents = [Document(
+            page_content=text,
+            metadata={"filetype": "docx"},
+        )]
+        store = chunk_and_embed(documents, fname, index_dir)
         if store:
             st.session_state["pdf_stores"][fname] = store
             if mode == "private" and session_id:
                 _save_file_meta(session_id, fname, "docx")
             elif mode == "room" and room_code:
                 _add_file_to_room_db(room_code, fname, "docx")
+                if not _sync_room_file_to_cloud(room_code, fname, "docx"):
+                    st.warning(
+                        f"{fname} was indexed locally, but shared room sync to "
+                        f"Firebase Storage did not complete."
+                    )
 
     elif ext in ["jpg", "jpeg", "png", "webp"]:
         img_b64 = image_to_base64(uploaded_file)
@@ -349,6 +653,11 @@ def process_uploaded_file(uploaded_file, index_dir: str,
             _save_file_meta(session_id, fname, "image")
         elif mode == "room" and room_code:
             _add_file_to_room_db(room_code, fname, "image")
+            if not _sync_room_file_to_cloud(room_code, fname, "image"):
+                st.warning(
+                    f"{fname} was saved locally, but shared room sync to "
+                    f"Firebase Storage did not complete."
+                )
 
     # FIX: Only touch room_selected_files when actually in room mode,
     # so a private upload never clobbers the room's file selection.
@@ -359,6 +668,123 @@ def process_uploaded_file(uploaded_file, index_dir: str,
     st.session_state["selected_files"] = all_files
     if mode == "room":
         st.session_state["room_selected_files"] = all_files
+
+
+def make_upload_signature(uploaded_file, scope_id: str) -> str:
+    return f"{scope_id}:{uploaded_file.name}:{getattr(uploaded_file, 'size', 0)}"
+
+
+def _room_file_ref(code: str, filename: str):
+    safe_key = _safe_firebase_key(filename)
+    return db.child("rooms").child(code).child("files").child(safe_key)
+
+
+def _room_index_dir(code: str, filename: str) -> str:
+    return os.path.join(ROOMS_DIR, code, "indexes", filename)
+
+
+def _room_image_path(code: str, filename: str) -> str:
+    return os.path.join(ROOMS_DIR, code, "images", filename)
+
+
+def _room_index_storage_base(code: str, filename: str) -> str:
+    return f"room_assets/{code}/indexes/{_safe_firebase_key(filename)}"
+
+
+def _room_image_storage_path(code: str, filename: str) -> str:
+    return f"room_assets/{code}/images/{_safe_firebase_key(filename)}"
+
+
+def _update_room_file_db(code: str, filename: str, updates: dict):
+    _room_file_ref(code, filename).update(updates)
+
+
+def _firebase_storage():
+    return firebase_app.storage()
+
+
+def _upload_to_storage(local_path: str, storage_path: str):
+    _firebase_storage().child(storage_path).put(local_path)
+
+
+def _download_from_storage(storage_path: str, local_path: str) -> bool:
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    _firebase_storage().child(storage_path).download(storage_path, local_path)
+    return os.path.exists(local_path)
+
+
+def _room_index_files_exist(code: str, filename: str) -> bool:
+    index_dir = _room_index_dir(code, filename)
+    return (
+        os.path.exists(os.path.join(index_dir, "index.faiss")) and
+        os.path.exists(os.path.join(index_dir, "index.pkl"))
+    )
+
+
+def _sync_room_file_to_cloud(code: str, filename: str, filetype: str) -> bool:
+    try:
+        if filetype in ["pdf", "docx"]:
+            if not _room_index_files_exist(code, filename):
+                return False
+            storage_base = _room_index_storage_base(code, filename)
+            index_dir = _room_index_dir(code, filename)
+            _upload_to_storage(
+                os.path.join(index_dir, "index.faiss"),
+                f"{storage_base}/index.faiss",
+            )
+            _upload_to_storage(
+                os.path.join(index_dir, "index.pkl"),
+                f"{storage_base}/index.pkl",
+            )
+            _update_room_file_db(code, filename, {
+                "cloud_synced": True,
+                "storage_kind": "faiss_index",
+                "storage_base": storage_base,
+            })
+            return True
+
+        if filetype == "image":
+            image_path = _room_image_path(code, filename)
+            if not os.path.exists(image_path):
+                return False
+            storage_path = _room_image_storage_path(code, filename)
+            _upload_to_storage(image_path, storage_path)
+            _update_room_file_db(code, filename, {
+                "cloud_synced": True,
+                "storage_kind": "image",
+                "storage_path": storage_path,
+            })
+            return True
+    except Exception:
+        return False
+
+    return False
+
+
+def _download_room_file_from_cloud(code: str, filename: str, meta: dict) -> bool:
+    try:
+        filetype = meta.get("type", "")
+        if filetype in ["pdf", "docx"]:
+            storage_base = meta.get("storage_base") or _room_index_storage_base(code, filename)
+            index_dir = _room_index_dir(code, filename)
+            os.makedirs(index_dir, exist_ok=True)
+            faiss_ok = _download_from_storage(
+                f"{storage_base}/index.faiss",
+                os.path.join(index_dir, "index.faiss"),
+            )
+            pkl_ok = _download_from_storage(
+                f"{storage_base}/index.pkl",
+                os.path.join(index_dir, "index.pkl"),
+            )
+            return faiss_ok and pkl_ok
+
+        if filetype == "image":
+            storage_path = meta.get("storage_path") or _room_image_storage_path(code, filename)
+            return _download_from_storage(storage_path, _room_image_path(code, filename))
+    except Exception:
+        return False
+
+    return False
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -521,13 +947,22 @@ def send_room_message(code: str, user: str, content: str,
 
 def get_room_files(code: str) -> list:
     """Return real filenames from the room's Firebase file registry."""
+    registry = get_room_file_registry(code)
+    return list(registry.keys())
+
+
+def get_room_file_registry(code: str) -> dict:
     try:
         files = db.child("rooms").child(code).child("files").get()
         if files.val():
-            return [v.get("filename", k) for k, v in files.val().items()]
-        return []
+            return {
+                v.get("filename", k): v
+                for k, v in files.val().items()
+                if isinstance(v, dict)
+            }
+        return {}
     except:
-        return []
+        return {}
 
 def _room_history_for_llm(code: str) -> list:
     """
@@ -556,6 +991,7 @@ def _add_file_to_room_db(code: str, filename: str, filetype: str):
         "filename":    filename,
         "uploaded_by": st.session_state["username"],
         "uploaded_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "cloud_synced": False,
     })
 
 def get_all_rooms() -> dict:
@@ -582,35 +1018,53 @@ def load_room_files_into_state(code: str):
     user become immediately available to all room members.
     Also ensures room_selected_files defaults to all available files.
     """
-    room_files = get_room_files(code)
-    index_dir  = os.path.join(ROOMS_DIR, code, "indexes")
-    img_dir    = os.path.join(ROOMS_DIR, code, "images")
+    room_files = get_room_file_registry(code)
 
     newly_loaded = []
-    for fname in room_files:
+    unavailable = []
+    for fname, meta in room_files.items():
+        filetype = meta.get("type", "")
+
+        # Migration path: if this device already has a local copy/index for an
+        # older room file, backfill it to Firebase Storage so other devices can
+        # download it too.
+        if not meta.get("cloud_synced"):
+            _sync_room_file_to_cloud(code, fname, filetype)
+
         if (fname in st.session_state["pdf_stores"] or
                 fname in st.session_state["image_files"]):
             continue
-        ext = fname.rsplit(".", 1)[-1].lower()
-        if ext in ["pdf", "docx"]:
-            store = load_faiss_index(fname, index_dir)
+
+        if filetype in ["pdf", "docx"]:
+            if not _room_index_files_exist(code, fname):
+                if meta.get("cloud_synced") or meta.get("storage_base"):
+                    _download_room_file_from_cloud(code, fname, meta)
+            store = load_faiss_index(fname, os.path.join(ROOMS_DIR, code, "indexes"))
             if store:
                 st.session_state["pdf_stores"][fname] = store
                 newly_loaded.append(fname)
-        elif ext in ["jpg", "jpeg", "png", "webp"]:
-            img_path = os.path.join(img_dir, fname)
+            else:
+                unavailable.append(fname)
+        elif filetype == "image":
+            img_path = _room_image_path(code, fname)
+            if not os.path.exists(img_path):
+                if meta.get("cloud_synced") or meta.get("storage_path"):
+                    _download_room_file_from_cloud(code, fname, meta)
             if os.path.exists(img_path):
                 with open(img_path, "rb") as f:
                     st.session_state["image_files"][fname] = (
                         base64.b64encode(f.read()).decode()
                     )
                 newly_loaded.append(fname)
+            else:
+                unavailable.append(fname)
 
     all_files = (
         list(st.session_state["pdf_stores"].keys()) +
         list(st.session_state["image_files"].keys())
     )
     st.session_state["selected_files"] = all_files
+    st.session_state["room_unavailable_files"] = unavailable
 
     # Auto-select all files for room querying by default
     if not st.session_state["room_selected_files"] and all_files:
@@ -650,6 +1104,7 @@ with st.sidebar:
                     st.session_state["image_files"]        = {}
                     st.session_state["selected_files"]     = []
                     st.session_state["room_selected_files"]= []
+                    st.session_state["room_unavailable_files"] = []
                     st.rerun()
         else:
             st.info(f"👤 **{st.session_state['username']}** (Guest)")
@@ -662,6 +1117,7 @@ with st.sidebar:
                 st.session_state["image_files"]        = {}
                 st.session_state["selected_files"]     = []
                 st.session_state["room_selected_files"]= []
+                st.session_state["room_unavailable_files"] = []
                 st.rerun()
 
         st.divider()
@@ -736,20 +1192,31 @@ with st.sidebar:
                         st.rerun()
 
                 st.subheader("📁 Upload Files")
+                st.caption(
+                    f"Reliable indexing works best with files up to "
+                    f"{MAX_UPLOAD_MB} MB."
+                )
                 uploaded = st.file_uploader(
                     "PDFs, DOCs or Images",
                     type=["pdf", "docx", "jpg", "jpeg", "png", "webp"],
-                    key="priv_uploader",
+                    key=f"priv_uploader_{st.session_state['current_session_id']}",
                 )
                 if uploaded:
                     sid       = st.session_state["current_session_id"]
                     index_dir = os.path.join(SESSIONS_DIR, sid, "indexes")
-                    with st.spinner(f"Processing {uploaded.name}…"):
-                        process_uploaded_file(
-                            uploaded, index_dir,
-                            mode="private", session_id=sid,
-                        )
-                    st.success(f"✅ {uploaded.name} ready!")
+                    current_sig = make_upload_signature(uploaded, sid)
+                    if st.session_state["private_upload_sig"] != current_sig:
+                        with st.spinner(f"Processing {uploaded.name}…"):
+                            try:
+                                process_uploaded_file(
+                                    uploaded, index_dir,
+                                    mode="private", session_id=sid,
+                                )
+                            except Exception as e:
+                                st.error(f"Could not process {uploaded.name}: {e}")
+                            else:
+                                st.session_state["private_upload_sig"] = current_sig
+                                st.success(f"✅ {uploaded.name} ready!")
 
                 all_files = (
                     list(st.session_state["pdf_stores"].keys()) +
@@ -784,6 +1251,7 @@ with st.sidebar:
                     st.session_state["image_files"]        = {}
                     st.session_state["selected_files"]     = []
                     st.session_state["room_selected_files"]= []
+                    st.session_state["room_unavailable_files"] = []
                     st.success(f"✅ Room created!  Code: **{code}**")
                     st.rerun()
 
@@ -799,6 +1267,7 @@ with st.sidebar:
                         st.session_state["image_files"]        = {}
                         st.session_state["selected_files"]     = []
                         st.session_state["room_selected_files"]= []
+                        st.session_state["room_unavailable_files"] = []
                         st.rerun()
                     else:
                         st.error("Room not found.")
@@ -822,6 +1291,7 @@ with st.sidebar:
                             st.session_state["image_files"]        = {}
                             st.session_state["selected_files"]     = []
                             st.session_state["room_selected_files"]= []
+                            st.session_state["room_unavailable_files"] = []
                             st.rerun()
                     with col2:
                         if st.button("🗑", key=f"dr_{code}"):
@@ -834,20 +1304,31 @@ with st.sidebar:
             if st.session_state.get("current_room_code"):
                 st.divider()
                 st.subheader("📁 Upload to Room")
+                st.caption(
+                    f"Reliable indexing works best with files up to "
+                    f"{MAX_UPLOAD_MB} MB."
+                )
                 room_file = st.file_uploader(
                     "PDF, DOCX, or Image",
                     type=["pdf", "docx", "jpg", "jpeg", "png", "webp"],
-                    key="room_uploader",
+                    key=f"room_uploader_{st.session_state['current_room_code']}",
                 )
                 if room_file:
                     code      = st.session_state["current_room_code"]
                     index_dir = os.path.join(ROOMS_DIR, code, "indexes")
-                    with st.spinner(f"Processing {room_file.name}…"):
-                        process_uploaded_file(
-                            room_file, index_dir,
-                            mode="room", room_code=code,
-                        )
-                    st.success(f"✅ {room_file.name} added to room!")
+                    current_sig = make_upload_signature(room_file, code)
+                    if st.session_state["room_upload_sig"] != current_sig:
+                        with st.spinner(f"Processing {room_file.name}…"):
+                            try:
+                                process_uploaded_file(
+                                    room_file, index_dir,
+                                    mode="room", room_code=code,
+                                )
+                            except Exception as e:
+                                st.error(f"Could not process {room_file.name}: {e}")
+                            else:
+                                st.session_state["room_upload_sig"] = current_sig
+                                st.success(f"✅ {room_file.name} added to room!")
 
                 # ── File selector (auth user only, visible in room) ──
                 all_room_files = (
@@ -1016,6 +1497,12 @@ elif mode == "room":
         room_files = get_room_files(code)
         if room_files:
             st.caption(f"📂 Files in room: {', '.join(room_files)}")
+        unavailable = st.session_state.get("room_unavailable_files", [])
+        if unavailable:
+            st.warning(
+                "These room files are registered in Firebase, but this device "
+                f"could not load them yet: {', '.join(unavailable)}"
+            )
 
         # Show currently active query scope
         active = st.session_state.get("room_selected_files", [])
