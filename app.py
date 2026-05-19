@@ -71,15 +71,12 @@ _GATEWAY_PROVIDER_CHOICES = {
 }
 _BUILTIN_GATEWAY_CHAT_MODELS = [
     {"model": "gpt-4o",          "label": "gpt-4o"},
-    {"model": "gpt-4o-mini",     "label": "gpt-4o-mini"},
     {"model": "gpt-4.1",         "label": "gpt-4.1"},
     {"model": "gpt-4.1-mini",    "label": "gpt-4.1-mini"},
     {"model": "gpt-5",           "label": "gpt-5"},
     {"model": "gpt-5.2",         "label": "gpt-5.2"},
     {"model": "gpt-5.2-chat",    "label": "gpt-5.2-chat"},
     {"model": "gpt-5.2-codex",   "label": "gpt-5.2-codex"},
-    {"model": "o1",              "label": "o1"},
-    {"model": "o3-mini",         "label": "o3-mini"},
     {
         "model": "claude-opus-4.6",
         "label": "claude-opus-4.6",
