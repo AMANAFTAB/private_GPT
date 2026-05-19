@@ -6,17 +6,17 @@ import base64
 import shutil
 import string
 import random
+import re
+import requests
 from datetime import datetime
 from PyPDF2 import PdfReader
 from docx import Document as DocxDocument
 from PIL import Image
 import io
-import re
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
-from openai import AzureOpenAI, BadRequestError
 import pyrebase
 from streamlit_autorefresh import st_autorefresh
 
@@ -30,27 +30,222 @@ st.set_page_config(
 )
 
 # ══════════════════════════════════════════════════════════════════════
-# AZURE Authentication
-# All models share the same endpoint/key since they are deployed under the same Azure AI Foundry resource.
+# ENX LLM GATEWAY CONFIG
+# The gateway is used for both chat (LLM) and embeddings.
+# Azure credentials below are optional and used ONLY as a vision fallback
+# (image queries) if the gateway does not support multimodal input.
 # ══════════════════════════════════════════════════════════════════════
-AZURE_ENDPOINT       = st.secrets["MODELS_ENDPOINT"]
-AZURE_API_KEY        = st.secrets["LLM_API_KEY"]
-AZURE_API_VERSION    = "2025-04-01-preview"
-LLM_DEPLOYMENT       = "Llama-4-Maverick-17B-128E-Instruct-FP8"
-EMBEDDING_DEPLOYMENT = "embed-v-4-0"
-EMBEDDING_BATCH_SIZE = 96
-MAX_UPLOAD_MB        = 20
-MAX_UPLOAD_BYTES     = MAX_UPLOAD_MB * 1024 * 1024
-PAGE_QUERY_RE        = re.compile(
+GATEWAY_BASE_URL    = "https://alb.prod.shared.aifoundations.digital.cloud.int/gateway"
+GATEWAY_COMPANY     = st.secrets["gateway"]["company"]
+GATEWAY_PROJECT_ID  = st.secrets["gateway"]["project_id"]
+GATEWAY_TOKEN       = st.secrets["gateway"]["project_token"]
+GATEWAY_CHAT_MODEL  = st.secrets["gateway"].get("chat_model", "gpt-5.2")
+GATEWAY_CHAT_PROVIDER = st.secrets["gateway"].get("chat_provider")
+
+_gateway_available_models = st.secrets["gateway"].get("chat_available_models", [])
+if isinstance(_gateway_available_models, str):
+    _gateway_available_models = [
+        model.strip()
+        for model in _gateway_available_models.split(",")
+        if model.strip()
+    ]
+
+_gateway_chat_fallbacks = st.secrets["gateway"].get("chat_fallback_models", [])
+if isinstance(_gateway_chat_fallbacks, str):
+    _gateway_chat_fallbacks = [
+        model.strip()
+        for model in _gateway_chat_fallbacks.split(",")
+        if model.strip()
+    ]
+
+if not _gateway_available_models:
+    _gateway_available_models = [
+        GATEWAY_CHAT_MODEL,
+        *_gateway_chat_fallbacks,
+    ]
+
+_GATEWAY_PROVIDER_CHOICES = {
+    "auto": "Auto detect",
+    "azureOpenAi": "Azure OpenAI",
+    "bedrock": "Amazon Bedrock",
+}
+_BUILTIN_GATEWAY_CHAT_MODELS = [
+    {"model": "gpt-4o",          "label": "gpt-4o"},
+    {"model": "gpt-4o-mini",     "label": "gpt-4o-mini"},
+    {"model": "gpt-4.1",         "label": "gpt-4.1"},
+    {"model": "gpt-4.1-mini",    "label": "gpt-4.1-mini"},
+    {"model": "gpt-5",           "label": "gpt-5"},
+    {"model": "gpt-5.2",         "label": "gpt-5.2"},
+    {"model": "gpt-5.2-chat",    "label": "gpt-5.2-chat"},
+    {"model": "gpt-5.2-codex",   "label": "gpt-5.2-codex"},
+    {"model": "o1",              "label": "o1"},
+    {"model": "o3-mini",         "label": "o3-mini"},
+    {
+        "model": "claude-opus-4.6",
+        "label": "claude-opus-4.6",
+        "provider": "bedrock",
+    },
+    {
+        "model": "claude-sonnet-4.6",
+        "label": "claude-sonnet-4.6",
+        "provider": "bedrock",
+    },
+    {
+        "model": "claude-haiku-4.5",
+        "label": "claude-haiku-4.5",
+        "provider": "bedrock",
+    },
+]
+
+
+def _normalize_gateway_provider(provider: str | None) -> str | None:
+    if provider is None:
+        return None
+    normalized = str(provider).strip()
+    if not normalized or normalized.lower() == "auto":
+        return None
+    return normalized
+
+
+def _gateway_model_display_name(model: str, provider: str | None = None) -> str:
+    provider_labels = {
+        **_GATEWAY_PROVIDER_CHOICES,
+        "AZURE_OPEN_AI": "Azure OpenAI",
+        "BEDROCK": "Amazon Bedrock",
+        "azureOpenAi": "Azure OpenAI",
+        "bedrock": "Amazon Bedrock",
+        "Azure OpenAI": "Azure OpenAI",
+        "Amazon Bedrock": "Amazon Bedrock",
+    }
+    provider_label = provider_labels.get(provider)
+    if provider_label and provider != "auto":
+        return f"{model} ({provider_label})"
+    return model
+
+
+def _coerce_gateway_chat_model_spec(
+    value,
+    default_provider: str | None = None,
+) -> dict | None:
+    if isinstance(value, dict):
+        model = str(value.get("model") or value.get("name") or "").strip()
+        provider = _normalize_gateway_provider(
+            value.get("provider") if "provider" in value else default_provider
+        )
+        label = str(value.get("label") or model).strip()
+        if not model:
+            return None
+        return {
+            "model": model,
+            "provider": provider,
+            "label": label or _gateway_model_display_name(model, provider),
+        }
+
+    if not isinstance(value, str):
+        return None
+
+    raw = value.strip()
+    if not raw:
+        return None
+
+    provider = default_provider
+    model = raw
+    prefix, sep, remainder = raw.partition(":")
+    if sep and prefix in _GATEWAY_PROVIDER_CHOICES and prefix != "auto":
+        provider = prefix
+        model = remainder.strip()
+
+    builtin = next(
+        (
+            spec
+            for spec in _BUILTIN_GATEWAY_CHAT_MODELS
+            if spec["model"].lower() == model.lower()
+        ),
+        None,
+    )
+    if builtin:
+        return dict(builtin)
+
+    provider = _normalize_gateway_provider(provider)
+    return {
+        "model": model,
+        "provider": provider,
+        "label": _gateway_model_display_name(model, provider),
+    }
+
+
+def _dedupe_gateway_chat_model_specs(specs: list[dict]) -> list[dict]:
+    deduped = []
+    seen = set()
+    for spec in specs:
+        if not spec or not spec.get("model"):
+            continue
+        key = (
+            spec["model"].lower(),
+            (spec.get("provider") or "").lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(spec)
+    return deduped
+
+
+def _build_gateway_chat_model_catalog() -> list[dict]:
+    configured = []
+    for value in _gateway_available_models:
+        spec = _coerce_gateway_chat_model_spec(
+            value,
+            default_provider=GATEWAY_CHAT_PROVIDER,
+        )
+        if spec:
+            configured.append(spec)
+
+    return _dedupe_gateway_chat_model_specs(configured)
+
+
+GATEWAY_CHAT_MODEL_SPECS = _build_gateway_chat_model_catalog()
+GATEWAY_EMBED_MODEL = "text-embedding-ada-002"
+GATEWAY_VERIFY_SSL  = (
+    st.secrets["gateway"].get("ssl_cert_path")
+    or st.secrets["gateway"].get("verify_ssl", True)
+)
+
+# How many past turns to send to the LLM (keeps prompt size bounded)
+HISTORY_WINDOW = 10
+
+# ── Optional Azure fallback (vision / images only) ───────────────────
+# If MODELS_ENDPOINT and LLM_API_KEY are present in secrets, image queries
+# are routed to Azure.  If not, images are still accepted but answered
+# in text-only mode with a warning.
+_AZURE_ENDPOINT = st.secrets.get("MODELS_ENDPOINT")
+_AZURE_API_KEY  = st.secrets.get("LLM_API_KEY")
+_AZURE_API_VER  = "2025-04-01-preview"
+_AZURE_LLM_DEP  = st.secrets.get("AZURE_LLM_DEPLOYMENT",
+                                   "Llama-4-Maverick-17B-128E-Instruct-FP8")
+AZURE_VISION_OK = bool(_AZURE_ENDPOINT and _AZURE_API_KEY)
+
+# ── Regex helpers for page / section routing ─────────────────────────
+PAGE_QUERY_RE       = re.compile(
     r"\bpage(?:\s+number|\s+no\.?)?\s+(\d+)\b", re.IGNORECASE
 )
-SECTION_TITLE_RE     = re.compile(
-    r'\bsection\s+[\"“”\']([^\"“”\']+)[\"“”\']', re.IGNORECASE
+SECTION_TITLE_RE    = re.compile(
+    r'\bsection\s+["""\'"]([^"""\'\"]+)["""\'"]', re.IGNORECASE
 )
-SECTION_FOLLOWUP_RE  = re.compile(r"\b(that|this|the)\s+section\b", re.IGNORECASE)
+SECTION_FOLLOWUP_RE = re.compile(r"\b(that|this|the)\s+section\b", re.IGNORECASE)
+MODEL_IDENTITY_RE   = re.compile(
+    r"(?:\b(?:which|what)\s+(?:llm|model)\s+(?:are you|is this|am i using|powers you)\b"
+    r"|\bwho\s+(?:made|created)\s+you\b"
+    r"|\bare\s+you\s+(?:chatgpt|gpt[-\s]?4|gpt[-\s]?5)\b)",
+    re.IGNORECASE,
+)
+
+# ── File upload limits ───────────────────────────────────────────────
+MAX_UPLOAD_MB    = 20
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
 # ══════════════════════════════════════════════════════════════════════
-# FIREBASE Authentication
+# FIREBASE CONFIG
 # ══════════════════════════════════════════════════════════════════════
 FIREBASE_CONFIG = {
     "apiKey":            st.secrets["firebase"]["apiKey"],
@@ -82,195 +277,520 @@ os.makedirs(ROOMS_DIR,    exist_ok=True)
 # SESSION STATE BOOTSTRAP
 # ══════════════════════════════════════════════════════════════════════
 DEFAULTS = {
-    "authenticated":      False,
-    "username":           "",
-    "mode":               "private",
-    "current_session_id": None,
-    "current_room_code":  None,
-    "pdf_stores":         {},
-    "image_files":        {},
-    "selected_files":     [],
-    "chat_history":       [],
-    "room_thinking":      False,
-    "room_selected_files": [],   # tracks file selection specifically for rooms
-    "private_upload_sig": None,
-    "room_upload_sig":    None,
+    "authenticated":          False,
+    "username":               "",
+    "mode":                   "private",
+    "current_session_id":     None,
+    "current_room_code":      None,
+    "pdf_stores":             {},
+    "image_files":            {},
+    "selected_files":         [],
+    "chat_history":           [],
+    "room_thinking":          False,
+    "room_selected_files":    [],
+    "private_upload_sig":     None,
+    "room_upload_sig":        None,
     "room_unavailable_files": [],
+    "gateway_working_chat_model": None,
+    "gateway_working_chat_provider": None,
+    "gateway_last_response_model": None,
+    "gateway_last_response_provider": None,
+    "gateway_selected_chat_model": GATEWAY_CHAT_MODEL,
 }
 for key, val in DEFAULTS.items():
     if key not in st.session_state:
         st.session_state[key] = val
 
 # ══════════════════════════════════════════════════════════════════════
-# FIREBASE INIT --> uses the [firebase] config parameters mentioned in the .secrets/secrets.toml file
+# FIREBASE INIT
+# The full firebase_app is kept (not just db) because Firebase Storage
+# is used to sync room files across devices.
 # ══════════════════════════════════════════════════════════════════════
 @st.cache_resource
 def init_firebase():
     return pyrebase.initialize_app(FIREBASE_CONFIG)
 
 firebase_app = init_firebase()
-db = firebase_app.database()
+db           = firebase_app.database()
 
 # ══════════════════════════════════════════════════════════════════════
-# AZURE CLIENTS --> calling the embedding model
+# GATEWAY — HELPERS
 # ══════════════════════════════════════════════════════════════════════
-class AzureOpenAIEmbeddings(Embeddings):
-    """
-    Wraps the Azure OpenAI embeddings API to be compatible with FAISS.
-    embed_documents()  called when indexing uploaded file chunks.
-    embed_query()      called when converting a user question to a vector.
-    """
-    def __init__(self, client, deployment: str):
-        self.client     = client
-        self.deployment = deployment
+def _gateway_headers() -> dict:
+    """Standard headers required by every gateway request."""
+    return {
+        "Content-Type": "application/json",
+        "Accept":       "application/json",
+        "company":      GATEWAY_COMPANY,
+        "projectId":    GATEWAY_PROJECT_ID,
+        "projectToken": GATEWAY_TOKEN,
+    }
 
+
+def _gateway_error_message(resp) -> str:
+    try:
+        payload = resp.json()
+    except ValueError:
+        return resp.text.strip() or f"HTTP {resp.status_code}"
+
+    if isinstance(payload, dict):
+        message = payload.get("message")
+        if message:
+            return message
+        error = payload.get("error")
+        if isinstance(error, str) and error:
+            return error
+
+    return str(payload)
+
+
+def _selected_gateway_chat_spec() -> dict | None:
+    selection = st.session_state.get(
+        "gateway_selected_chat_model",
+        GATEWAY_CHAT_MODEL,
+    )
+
+    if selection:
+        for spec in GATEWAY_CHAT_MODEL_SPECS:
+            if spec["model"] == selection:
+                return spec
+
+    return None
+
+
+def _gateway_chat_model_candidates() -> list[dict]:
+    selected = _selected_gateway_chat_spec()
+    if selected:
+        return [selected]
+
+    preferred_model = st.session_state.get("gateway_working_chat_model")
+    preferred_provider = st.session_state.get("gateway_working_chat_provider")
+    candidates = []
+    if preferred_model:
+        candidates.append({
+            "model": preferred_model,
+            "provider": preferred_provider,
+            "label": _gateway_model_display_name(
+                preferred_model,
+                preferred_provider,
+            ),
+        })
+
+    return _dedupe_gateway_chat_model_specs([
+        *candidates,
+        *GATEWAY_CHAT_MODEL_SPECS,
+    ])
+
+
+def _format_gateway_chat_spec(spec: dict) -> str:
+    return _gateway_model_display_name(spec["model"], spec.get("provider"))
+
+
+def _current_gateway_model_status() -> str:
+    selected = _selected_gateway_chat_spec()
+    if selected:
+        return selected["label"]
+
+    working_model = st.session_state.get("gateway_working_chat_model")
+    working_provider = st.session_state.get("gateway_working_chat_provider")
+    if working_model:
+        return _gateway_model_display_name(working_model, working_provider)
+
+    if GATEWAY_CHAT_MODEL_SPECS:
+        return GATEWAY_CHAT_MODEL_SPECS[0]["label"]
+
+    return GATEWAY_CHAT_MODEL
+
+
+def _effective_user_question(prompt: str) -> str:
+    question_marker = "Question:"
+    answer_marker = "\n\nAnswer:"
+    if question_marker in prompt:
+        extracted = prompt.rsplit(question_marker, 1)[-1]
+        if answer_marker in extracted:
+            extracted = extracted.split(answer_marker, 1)[0]
+        return extracted.strip()
+    return prompt.strip()
+
+
+def _is_model_identity_question(prompt: str) -> bool:
+    return bool(MODEL_IDENTITY_RE.search(_effective_user_question(prompt)))
+
+
+def _model_identity_response(prompt: str, images: list = None) -> str | None:
+    if not _is_model_identity_question(prompt):
+        return None
+
+    selected = _selected_gateway_chat_spec()
+    selected_label = selected["label"] if selected else _current_gateway_model_status()
+    backend_model = st.session_state.get("gateway_last_response_model")
+    backend_provider = st.session_state.get("gateway_last_response_provider")
+
+    parts = [
+        f"This AM Intelligence chat is currently configured to use {selected_label}."
+    ]
+    if backend_model:
+        parts.append(
+            "The last successful gateway response for this chat reported "
+            f"{_gateway_model_display_name(backend_model, backend_provider)}."
+        )
+    else:
+        parts.append(
+            "The gateway has not yet reported a backend-resolved model name for this chat."
+        )
+    if images:
+        parts.append(
+            f"If you attach images, the app can use the Azure vision fallback deployment {_AZURE_LLM_DEP}."
+        )
+    parts.append(
+        "If you ask the model directly which model it is, it can answer inaccurately because that reply is generated text, not app metadata."
+    )
+    return " ".join(parts)
+
+
+def _is_model_not_allowed(resp, model: str) -> bool:
+    message = _gateway_error_message(resp).lower()
+    return (
+        resp.status_code == 400
+        and "not allowed" in message
+        and model.lower() in message
+    )
+
+
+def _extract_gateway_embedding_outputs(payload: dict) -> list[list[float]]:
+    if isinstance(payload, dict):
+        results = payload.get("results")
+        if isinstance(results, list):
+            outputs = []
+            for item in results:
+                if isinstance(item, dict) and isinstance(item.get("output"), list):
+                    outputs.append(item["output"])
+            if outputs:
+                return outputs
+
+        result = payload.get("result")
+        if isinstance(result, dict) and isinstance(result.get("output"), list):
+            return [result["output"]]
+
+        output = payload.get("output")
+        if isinstance(output, list):
+            return [output]
+
+        raise RuntimeError(
+            "Gateway embedding response did not include any vectors. "
+            f"Top-level keys: {', '.join(payload.keys()) or 'none'}."
+        )
+
+    raise RuntimeError(
+        "Gateway embedding response was not a JSON object. "
+        f"Received: {type(payload).__name__}."
+    )
+
+
+def _extract_gateway_chat_text(payload: dict) -> str:
+    generations = payload.get("generations") or []
+    if generations:
+        assistant_message = generations[0].get("assistant_message") or {}
+        text = assistant_message.get("text")
+        if isinstance(text, str):
+            return text
+    raise RuntimeError(
+        "Gateway chat response did not include assistant text."
+    )
+
+
+def _extract_gateway_chat_metadata(payload: dict) -> dict:
+    metadata = payload.get("chat_response_metadata") or {}
+    return {
+        "model": metadata.get("model"),
+        "provider": metadata.get("provider"),
+    }
+
+# ══════════════════════════════════════════════════════════════════════
+# GATEWAY — EMBEDDINGS
+# LangChain-compatible embeddings backed by the ENX LLM Gateway.
+# embed_documents() → called when indexing uploaded file chunks.
+# embed_query()     → called when converting a user question to a vector.
+# ══════════════════════════════════════════════════════════════════════
+class GatewayEmbeddings(Embeddings):
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-
-        all_embeddings = []
-        for start in range(0, len(texts), EMBEDDING_BATCH_SIZE):
-            batch = texts[start:start + EMBEDDING_BATCH_SIZE]
-            response = self.client.embeddings.create(
-                input=batch, model=self.deployment
-            )
-            all_embeddings.extend(item.embedding for item in response.data)
-        return all_embeddings
+        payload = {
+            "inputs":  texts,
+            "options": {"model": GATEWAY_EMBED_MODEL},
+        }
+        resp = requests.post(
+            f"{GATEWAY_BASE_URL}/embedding",
+            headers=_gateway_headers(),
+            json=payload,
+            verify=GATEWAY_VERIFY_SSL,
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return _extract_gateway_embedding_outputs(resp.json())
 
     def embed_query(self, text: str) -> list[float]:
-        response = self.client.embeddings.create(
-            input=[text], model=self.deployment
+        payload = {
+            "inputs":  [text],
+            "options": {"model": GATEWAY_EMBED_MODEL},
+        }
+        resp = requests.post(
+            f"{GATEWAY_BASE_URL}/embedding",
+            headers=_gateway_headers(),
+            json=payload,
+            verify=GATEWAY_VERIFY_SSL,
+            timeout=60,
         )
-        return response.data[0].embedding
+        resp.raise_for_status()
+        outputs = _extract_gateway_embedding_outputs(resp.json())
+        return outputs[0]
 
 
 @st.cache_resource
-def load_azure_client():
-    return AzureOpenAI(
-        azure_endpoint=AZURE_ENDPOINT,
-        api_key=AZURE_API_KEY,
-        api_version=AZURE_API_VERSION,
-    )
+def load_embeddings():
+    return GatewayEmbeddings()
 
-@st.cache_resource
-def load_embeddings(_client):
-    return AzureOpenAIEmbeddings(client=_client, deployment=EMBEDDING_DEPLOYMENT)
-
-azure_client = load_azure_client()
-embeddings   = load_embeddings(azure_client)
+embeddings = load_embeddings()
 
 # ══════════════════════════════════════════════════════════════════════
-# LLM HELPERS
+# GATEWAY — CHAT (LLM HELPERS)
 #
 # Temperature guide:
 # 0.0 ─── 0.2 ─── 0.5 ─── 0.7 ─── 1.0+
 #  |        |       |       |        |
 # Robotic Precise Balance Natural  Chaotic
 #
-# 0.18 → document Q&A  (precise, factual)
-# 0.85 → open chat     (natural, conversational)
+# 0.4 → document Q&A  (precise, grounded)
+# 0.85 → open chat    (natural, conversational)
 # ══════════════════════════════════════════════════════════════════════
-def ask_llm(prompt: str, has_context: bool = False,
-            images: list = None, history: list = None) -> str:
+_SYSTEM_DOC = (
+    "You are a helpful AI assistant. "
+    "When document context is provided, base your answer solely on it and "
+    "always cite which document your answer comes from. "
+    "If the context does not contain enough information, say so clearly."
+)
+_SYSTEM_CHAT = (
+    "You are a helpful, friendly AI assistant. "
+    "Answer questions naturally and conversationally."
+)
+
+
+def _build_gateway_history(history: list[dict], system_prompt: str) -> list[dict]:
     """
-    FIX – Azure AI Foundry gateway does not support the 'system' role.
-    Conversation rules are injected into the first user turn instead.
-    The optional `history` list ({"role", "content"} dicts) gives the LLM
-    conversational memory across turns.
+    Convert standard {"role": "user"/"assistant", "content": "..."} history
+    into the Gateway chat_history format.
+
+    The system prompt is injected into the first user message so the model
+    always has its instructions regardless of gateway system-message support.
     """
-    conversation_rules = (
-        "Conversation rules:\n"
-        "- Be a helpful assistant.\n"
-        "- If document context is provided, answer from it and mention the "
-        "document it came from.\n"
-        "- If no document context is provided, answer normally using your "
-        "general knowledge."
-    )
+    gw = []
+    first_user_seen = False
+    for msg in history:
+        role = "USER" if msg["role"] == "user" else "ASSISTANT"
+        text = msg["content"]
+        if role == "USER" and not first_user_seen:
+            text = f"[System Instructions]: {system_prompt}\n\n{text}"
+            first_user_seen = True
+        entry = {
+            "message_type": role,
+            "text_content":  text,
+            "media":         [],
+            "metadata":      {},
+        }
+        if role == "ASSISTANT":
+            entry["tool_calls"] = []
+        gw.append(entry)
+    return gw
 
-    messages = []
-    injected = False
 
-    # Replay history, injecting the conversation rules into the first user turn.
-    for turn in (history or []):
-        if turn["role"] == "user" and not injected:
-            messages.append({
-                "role":    "user",
-                "content": (
-                    f"{conversation_rules}\n\n"
-                    f"User message:\n{turn['content']}"
-                ),
-            })
-            injected = True
-        else:
-            messages.append({"role": turn["role"], "content": turn["content"]})
+def ask_llm(
+    prompt:      str,
+    has_context: bool = False,
+    images:      list = None,
+    history:     list = None,
+) -> str:
+    """
+    Send a message to the ENX LLM Gateway and return the text response.
 
-    # Current user turn
-    current_text = (
-        prompt if injected else f"{conversation_rules}\n\nUser message:\n{prompt}"
-    )
+    Parameters
+    ----------
+    prompt      : The user's current message / RAG-enriched prompt.
+    has_context : True when document excerpts are embedded in the prompt.
+    images      : List of base64 image strings.
+                  Routes to the Azure vision fallback when present.
+    history     : List of {"role": ..., "content": ...} prior messages.
+                  Last HISTORY_WINDOW items are included.
+    """
+    system_prompt = _SYSTEM_DOC  if has_context else _SYSTEM_CHAT
+    temperature   = 0.4          if has_context else 0.85
+
+    identity_response = _model_identity_response(prompt, images=images)
+    if identity_response:
+        return identity_response
+
+    # ── Vision path: route to Azure fallback ─────────────────────────
     if images:
-        content = [{"type": "text", "text": current_text}]
-        for img_b64 in images:
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
-            })
-        messages.append({"role": "user", "content": content})
-    else:
-        messages.append({"role": "user", "content": current_text})
-
-    try:
-        response = azure_client.chat.completions.create(
-            model=LLM_DEPLOYMENT,
-            messages=messages,
-            max_tokens=1000,
-            temperature=0.4 if has_context else 0.85,
-        )
-    except BadRequestError as exc:
-        err = getattr(exc, "body", {}) or {}
-        if err.get("error", {}).get("code") != "content_filter":
-            raise
-
-        # False positives can happen when provider filters react to the
-        # injected conversation rules or full replayed history. Retry once
-        # with only the current turn.
-        retry_messages = []
-        if images:
-            retry_content = [{"type": "text", "text": prompt}]
-            for img_b64 in images:
-                retry_content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
-                })
-            retry_messages.append({"role": "user", "content": retry_content})
+        if AZURE_VISION_OK:
+            return _ask_azure_with_images(prompt, has_context, images, history)
         else:
-            retry_messages.append({"role": "user", "content": prompt})
-
-        try:
-            response = azure_client.chat.completions.create(
-                model=LLM_DEPLOYMENT,
-                messages=retry_messages,
-                max_tokens=1000,
-                temperature=0.4 if has_context else 0.85,
+            st.warning(
+                "⚠️ Vision/image queries require Azure credentials which are "
+                "not configured. Answering in text-only mode."
             )
-        except BadRequestError as retry_exc:
-            retry_err = getattr(retry_exc, "body", {}) or {}
-            if retry_err.get("error", {}).get("code") == "content_filter":
-                return (
-                    "The model provider blocked this prompt under its content "
-                    "filter. This can be a false positive. Please try "
-                    "rephrasing the question slightly and try again."
-                )
-            raise
-    return response.choices[0].message.content
+            images = None   # fall through to gateway text path
 
+    # ── Build windowed history ────────────────────────────────────────
+    windowed   = (history or [])[-HISTORY_WINDOW:]
+    gw_history = _build_gateway_history(windowed, system_prompt) if windowed else []
+
+    # Prepend system only when there is no prior history
+    # (otherwise the system was already injected into the first history turn)
+    current_text = (
+        prompt if gw_history
+        else f"[System Instructions]: {system_prompt}\n\n{prompt}"
+    )
+
+    payload = {
+        "streaming":    False,
+        "message": {
+            "message_type": "USER",
+            "text_content":  current_text,
+            "media":         [],
+            "metadata":      {},
+        },
+        "chat_history": gw_history,
+        "temperature":  temperature,
+    }
+
+    selected_spec = _selected_gateway_chat_spec()
+
+    rejected_models = []
+    for spec in _gateway_chat_model_candidates():
+        request_body = {**payload, "model": spec["model"]}
+        if spec.get("provider"):
+            request_body["provider"] = spec["provider"]
+
+        resp = requests.post(
+            f"{GATEWAY_BASE_URL}/conversate",
+            headers=_gateway_headers(),
+            json=request_body,
+            verify=GATEWAY_VERIFY_SSL,
+            timeout=120,
+        )
+        if resp.ok:
+            response_payload = resp.json()
+            response_meta = _extract_gateway_chat_metadata(response_payload)
+            if selected_spec is None:
+                st.session_state["gateway_working_chat_model"] = spec["model"]
+                st.session_state["gateway_working_chat_provider"] = spec.get("provider")
+            if response_meta.get("model"):
+                st.session_state["gateway_last_response_model"] = response_meta["model"]
+                st.session_state["gateway_last_response_provider"] = response_meta.get("provider")
+            return _extract_gateway_chat_text(response_payload)
+
+        error_message = _gateway_error_message(resp)
+        if selected_spec is None and _is_model_not_allowed(resp, spec["model"]):
+            rejected_models.append(_format_gateway_chat_spec(spec))
+            continue
+
+        raise RuntimeError(
+            "Gateway chat request failed "
+            f"for {_format_gateway_chat_spec(spec)} "
+            f"({resp.status_code}): {error_message}"
+        )
+
+    tried_models = ", ".join(
+        _format_gateway_chat_spec(spec)
+        for spec in _gateway_chat_model_candidates()
+    )
+    rejected_text = ", ".join(rejected_models) or "none"
+    raise RuntimeError(
+        "Gateway chat request failed because this project does not allow any of "
+        f"the configured chat models. Tried: {tried_models}. Rejected: {rejected_text}."
+    )
+
+
+# ── Azure vision fallback (images only) ──────────────────────────────
+@st.cache_resource
+def _load_azure_client():
+    from openai import AzureOpenAI
+    return AzureOpenAI(
+        azure_endpoint=_AZURE_ENDPOINT,
+        api_key=_AZURE_API_KEY,
+        api_version=_AZURE_API_VER,
+    )
+
+
+def _ask_azure_with_images(
+    prompt:      str,
+    has_context: bool,
+    images:      list,
+    history:     list = None,
+) -> str:
+    """Azure OpenAI vision fallback — used only for image-bearing queries."""
+    system_prompt = _SYSTEM_DOC  if has_context else _SYSTEM_CHAT
+    temperature   = 0.4          if has_context else 0.85
+    client        = _load_azure_client()
+
+    messages = [{"role": "system", "content": system_prompt}]
+    for msg in (history or [])[-HISTORY_WINDOW:]:
+        messages.append({"role": msg["role"], "content": msg["content"]})
+
+    content = [{"type": "text", "text": prompt}]
+    for img_b64 in images:
+        content.append({
+            "type":      "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+        })
+    messages.append({"role": "user", "content": content})
+
+    resp = client.chat.completions.create(
+        model=_AZURE_LLM_DEP,
+        messages=messages,
+        max_tokens=1000,
+        temperature=temperature,
+    )
+    st.session_state["gateway_last_response_model"] = _AZURE_LLM_DEP
+    st.session_state["gateway_last_response_provider"] = "Azure OpenAI"
+    return resp.choices[0].message.content
+
+
+def _render_gateway_model_selector():
+    st.subheader("🤖 Choose your Model")
+
+    options = [spec["model"] for spec in GATEWAY_CHAT_MODEL_SPECS]
+    labels = {spec["model"]: spec["label"] for spec in GATEWAY_CHAT_MODEL_SPECS}
+
+    current = st.session_state.get("gateway_selected_chat_model", GATEWAY_CHAT_MODEL)
+    if current not in options:
+        current = GATEWAY_CHAT_MODEL if GATEWAY_CHAT_MODEL in options else options[0]
+        st.session_state["gateway_selected_chat_model"] = current
+
+    st.selectbox(
+        "Chat model",
+        options=options,
+        format_func=lambda option: labels.get(option, option),
+        key="gateway_selected_chat_model",
+        help=(
+            "Switch models in real time using the models allowed for this project."
+        ),
+    )
+
+    st.caption(f"Current selection: {_current_gateway_model_status()}")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# RAG CONTEXT HELPERS
+# (page-aware retrieval, section look-up, context formatting)
+# ══════════════════════════════════════════════════════════════════════
 
 def _format_context(matches: list[Document]) -> str:
     blocks = []
     for match in matches:
-        source = match.metadata.get("source", "unknown")
+        source      = match.metadata.get("source", "unknown")
         page_number = match.metadata.get("page_number")
-        heading = f"[From: {source}"
+        heading     = f"[From: {source}"
         if page_number is not None:
             heading += f", page {page_number}"
         heading += "]"
@@ -301,10 +821,8 @@ def _resolve_section_title(user_question: str, history: list = None):
     explicit = _extract_explicit_section_title(user_question)
     if explicit:
         return explicit
-
     if not SECTION_FOLLOWUP_RE.search(user_question):
         return None
-
     for turn in reversed(history or []):
         if turn.get("role") != "user":
             continue
@@ -345,8 +863,9 @@ def _get_page_chunks(store, filename: str, page_number: int) -> list[Document]:
 
 
 def _find_section_context(store, filename: str, section_title: str) -> list[Document]:
-    docs = _get_sorted_store_docs(store, filename)
+    docs   = _get_sorted_store_docs(store, filename)
     needle = _normalize_lookup_text(section_title)
+
     anchor_index = None
     for index, doc in enumerate(docs):
         if needle in _normalize_lookup_text(doc.page_content):
@@ -356,8 +875,8 @@ def _find_section_context(store, filename: str, section_title: str) -> list[Docu
     if anchor_index is None:
         return []
 
-    anchor = docs[anchor_index]
-    anchor_page = anchor.metadata.get("page_number")
+    anchor       = docs[anchor_index]
+    anchor_page  = anchor.metadata.get("page_number")
     anchor_chunk = anchor.metadata.get("chunk_index", 0)
 
     if anchor_page is None:
@@ -376,10 +895,16 @@ def _find_section_context(store, filename: str, section_title: str) -> list[Docu
 
 def build_response(user_question: str, history: list = None) -> str:
     """
-    Build context from selected files and return LLM answer.
-    In room mode, uses room_selected_files.
-    In private mode, uses selected_files.
-    FIX: passes history so the LLM has conversational memory.
+    Build context from selected files and return an LLM answer.
+
+    Supports:
+    - Page-specific retrieval  ("show me page 5")
+    - Section retrieval        ("tell me about section 'Introduction'")
+    - General similarity search
+    - Image queries (routed to Azure vision fallback if credentials exist)
+
+    In room mode uses room_selected_files; in private mode uses selected_files.
+    Passes history so the LLM maintains conversational memory across turns.
     """
     if st.session_state["mode"] == "room":
         selected = st.session_state["room_selected_files"]
@@ -396,15 +921,16 @@ def build_response(user_question: str, history: list = None) -> str:
     if not sel_text and not sel_imgs:
         return ask_llm(user_question, has_context=False, history=history)
 
-    requested_page = _extract_requested_page(user_question)
-    section_title = _resolve_section_title(user_question, history=history)
-    context = ""
-    direct_page_lookup = False
-    direct_section_lookup = False
+    requested_page         = _extract_requested_page(user_question)
+    section_title          = _resolve_section_title(user_question, history=history)
+    context                = ""
+    direct_page_lookup     = False
+    direct_section_lookup  = False
 
     if sel_text:
+        # ── Page-specific lookup ──────────────────────────────────────
         if requested_page is not None:
-            page_matches = []
+            page_matches     = []
             page_aware_files = []
             for fname in sel_text:
                 store = pdf_stores[fname]
@@ -414,7 +940,7 @@ def build_response(user_question: str, history: list = None) -> str:
                 page_matches.extend(_get_page_chunks(store, fname, requested_page))
 
             if page_matches:
-                context = _format_context(page_matches)
+                context            = _format_context(page_matches)
                 direct_page_lookup = True
             elif page_aware_files and not sel_imgs:
                 filenames = ", ".join(page_aware_files)
@@ -430,6 +956,7 @@ def build_response(user_question: str, history: list = None) -> str:
                     "indexed with page numbers."
                 )
 
+        # ── Section-specific lookup ───────────────────────────────────
         if section_title and not context:
             section_matches = []
             for fname in sel_text:
@@ -437,24 +964,26 @@ def build_response(user_question: str, history: list = None) -> str:
                     _find_section_context(pdf_stores[fname], fname, section_title)
                 )
             if section_matches:
-                context = _format_context(section_matches)
+                context               = _format_context(section_matches)
                 direct_section_lookup = True
 
+        # ── General similarity search ─────────────────────────────────
         if not context:
-            all_matches = []
+            all_matches     = []
             retrieval_query = user_question
             if section_title:
                 retrieval_query = f"{section_title}\n{user_question}"
             for fname in sel_text:
                 matches = pdf_stores[fname].similarity_search(
                     retrieval_query,
-                    k=4 if section_title else 2
+                    k=4 if section_title else 2,
                 )
                 for match in matches:
                     match.metadata["source"] = fname
                 all_matches.extend(matches)
             context = _format_context(all_matches)
 
+    # ── Build the final prompt ────────────────────────────────────────
     if context and sel_imgs:
         if direct_page_lookup:
             prompt = (
@@ -465,8 +994,8 @@ def build_response(user_question: str, history: list = None) -> str:
             )
         elif direct_section_lookup:
             prompt = (
-                f"Use the exact excerpts from the section titled "
-                f"\"{section_title}\" AND the provided images to answer.\n\n"
+                f'Use the exact excerpts from the section titled '
+                f'"{section_title}" AND the provided images to answer.\n\n'
                 f"Document Context:\n{context}\n\n"
                 f"Question: {user_question}\n\nAnswer:"
             )
@@ -486,8 +1015,8 @@ def build_response(user_question: str, history: list = None) -> str:
             )
         elif direct_section_lookup:
             prompt = (
-                f"Use the following exact excerpts from the section titled "
-                f"\"{section_title}\" to answer the question.\n\n"
+                f'Use the following exact excerpts from the section titled '
+                f'"{section_title}" to answer the question.\n\n'
                 f"Context:\n{context}\n\n"
                 f"Question: {user_question}\n\nAnswer:"
             )
@@ -511,8 +1040,9 @@ def build_response(user_question: str, history: list = None) -> str:
 # ══════════════════════════════════════════════════════════════════════
 
 def extract_pages_from_pdf(f) -> list[Document]:
+    """Extract text page-by-page, preserving page_number metadata."""
     f.seek(0)
-    reader = PdfReader(f)
+    reader    = PdfReader(f)
     page_docs = []
     for page_number, page in enumerate(reader.pages, start=1):
         text = page.extract_text() or ""
@@ -523,10 +1053,12 @@ def extract_pages_from_pdf(f) -> list[Document]:
             ))
     return page_docs
 
+
 def extract_text_from_docx(f) -> str:
     f.seek(0)
     doc = DocxDocument(f)
     return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+
 
 def image_to_base64(f) -> str:
     f.seek(0)
@@ -537,9 +1069,11 @@ def image_to_base64(f) -> str:
     img.save(buf, format="JPEG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
+
 def _chunk_documents(documents: list[Document], filename: str) -> list[Document]:
+    """Split documents into chunks while preserving page metadata."""
     splitter = RecursiveCharacterTextSplitter(
-        separators=["\n\n", "\n", " "],
+        separators=["\\n\\n", "\\n", " "],
         chunk_size=1000,
         chunk_overlap=150,
         length_function=len,
@@ -548,13 +1082,15 @@ def _chunk_documents(documents: list[Document], filename: str) -> list[Document]
     for document in documents:
         doc_chunks = splitter.split_text(document.page_content)
         for chunk_index, chunk in enumerate(doc_chunks):
-            metadata = dict(document.metadata)
-            metadata["source"] = filename
+            metadata                = dict(document.metadata)
+            metadata["source"]      = filename
             metadata["chunk_index"] = chunk_index
             chunks.append(Document(page_content=chunk, metadata=metadata))
     return chunks
 
+
 def chunk_and_embed(documents: list[Document], filename: str, index_dir: str):
+    """Embed chunked documents and save a FAISS index locally."""
     chunks = _chunk_documents(documents, filename)
     if not chunks:
         return None
@@ -564,6 +1100,7 @@ def chunk_and_embed(documents: list[Document], filename: str, index_dir: str):
     store.save_local(save_path)
     return store
 
+
 def load_faiss_index(filename: str, index_dir: str):
     path = os.path.join(index_dir, filename)
     if os.path.exists(path):
@@ -572,12 +1109,29 @@ def load_faiss_index(filename: str, index_dir: str):
         )
     return None
 
-def process_uploaded_file(uploaded_file, index_dir: str,
-                           mode: str = "private",
-                           session_id: str = None,
-                           room_code: str = None):
-    fname = uploaded_file.name
-    ext   = fname.rsplit(".", 1)[-1].lower()
+
+def process_uploaded_file(
+    uploaded_file,
+    index_dir: str,
+    mode: str = "private",
+    session_id: str = None,
+    room_code: str = None,
+):
+    """
+    Process an uploaded file:
+      - Extract text (PDF/DOCX) or base64-encode (images)
+      - Embed and save to FAISS where applicable
+      - Register metadata in session / room
+      - Sync room files to Firebase Storage
+
+    Notes:
+    - room_selected_files is only updated when mode == "room" so that a
+      private-session upload never leaks into room state.
+    - Files are deduplicated; re-uploading a PDF that lacked page metadata
+      will force a re-index.
+    """
+    fname     = uploaded_file.name
+    ext       = fname.rsplit(".", 1)[-1].lower()
     file_size = getattr(uploaded_file, "size", 0)
 
     if file_size and file_size > MAX_UPLOAD_BYTES:
@@ -593,6 +1147,7 @@ def process_uploaded_file(uploaded_file, index_dir: str,
     )
     if fname in already_loaded:
         existing_store = st.session_state["pdf_stores"].get(fname)
+        # Allow re-upload of PDFs that were indexed without page metadata
         if not (ext == "pdf" and existing_store and not _store_has_page_metadata(existing_store)):
             st.info(f"'{fname}' is already loaded!")
             return
@@ -621,10 +1176,7 @@ def process_uploaded_file(uploaded_file, index_dir: str,
         text = extract_text_from_docx(uploaded_file)
         if not text.strip():
             raise ValueError("No readable text could be extracted from this DOCX.")
-        documents = [Document(
-            page_content=text,
-            metadata={"filetype": "docx"},
-        )]
+        documents = [Document(page_content=text, metadata={"filetype": "docx"})]
         store = chunk_and_embed(documents, fname, index_dir)
         if store:
             st.session_state["pdf_stores"][fname] = store
@@ -659,8 +1211,6 @@ def process_uploaded_file(uploaded_file, index_dir: str,
                     f"Firebase Storage did not complete."
                 )
 
-    # FIX: Only touch room_selected_files when actually in room mode,
-    # so a private upload never clobbers the room's file selection.
     all_files = (
         list(st.session_state["pdf_stores"].keys()) +
         list(st.session_state["image_files"].keys())
@@ -671,8 +1221,13 @@ def process_uploaded_file(uploaded_file, index_dir: str,
 
 
 def make_upload_signature(uploaded_file, scope_id: str) -> str:
+    """Unique string to detect whether this file+scope has already been processed."""
     return f"{scope_id}:{uploaded_file.name}:{getattr(uploaded_file, 'size', 0)}"
 
+
+# ══════════════════════════════════════════════════════════════════════
+# FIREBASE STORAGE HELPERS (room file cloud sync)
+# ══════════════════════════════════════════════════════════════════════
 
 def _room_file_ref(code: str, filename: str):
     safe_key = _safe_firebase_key(filename)
@@ -727,7 +1282,7 @@ def _sync_room_file_to_cloud(code: str, filename: str, filetype: str) -> bool:
             if not _room_index_files_exist(code, filename):
                 return False
             storage_base = _room_index_storage_base(code, filename)
-            index_dir = _room_index_dir(code, filename)
+            index_dir    = _room_index_dir(code, filename)
             _upload_to_storage(
                 os.path.join(index_dir, "index.faiss"),
                 f"{storage_base}/index.faiss",
@@ -737,9 +1292,9 @@ def _sync_room_file_to_cloud(code: str, filename: str, filetype: str) -> bool:
                 f"{storage_base}/index.pkl",
             )
             _update_room_file_db(code, filename, {
-                "cloud_synced": True,
-                "storage_kind": "faiss_index",
-                "storage_base": storage_base,
+                "cloud_synced":  True,
+                "storage_kind":  "faiss_index",
+                "storage_base":  storage_base,
             })
             return True
 
@@ -750,14 +1305,13 @@ def _sync_room_file_to_cloud(code: str, filename: str, filetype: str) -> bool:
             storage_path = _room_image_storage_path(code, filename)
             _upload_to_storage(image_path, storage_path)
             _update_room_file_db(code, filename, {
-                "cloud_synced": True,
-                "storage_kind": "image",
-                "storage_path": storage_path,
+                "cloud_synced":  True,
+                "storage_kind":  "image",
+                "storage_path":  storage_path,
             })
             return True
     except Exception:
         return False
-
     return False
 
 
@@ -766,7 +1320,7 @@ def _download_room_file_from_cloud(code: str, filename: str, meta: dict) -> bool
         filetype = meta.get("type", "")
         if filetype in ["pdf", "docx"]:
             storage_base = meta.get("storage_base") or _room_index_storage_base(code, filename)
-            index_dir = _room_index_dir(code, filename)
+            index_dir    = _room_index_dir(code, filename)
             os.makedirs(index_dir, exist_ok=True)
             faiss_ok = _download_from_storage(
                 f"{storage_base}/index.faiss",
@@ -783,7 +1337,6 @@ def _download_room_file_from_cloud(code: str, filename: str, meta: dict) -> bool
             return _download_from_storage(storage_path, _room_image_path(code, filename))
     except Exception:
         return False
-
     return False
 
 
@@ -799,6 +1352,7 @@ def get_all_sessions() -> list:
             with open(mp) as f:
                 sessions.append(json.load(f))
     return sorted(sessions, key=lambda x: x.get("updated_at", ""), reverse=True)
+
 
 def create_new_session(name: str = None) -> str:
     sid         = str(uuid.uuid4())[:8]
@@ -818,6 +1372,7 @@ def create_new_session(name: str = None) -> str:
     with open(os.path.join(session_dir, "chat_history.json"), "w") as f:
         json.dump([], f)
     return sid
+
 
 def load_session(sid: str):
     session_dir = os.path.join(SESSIONS_DIR, sid)
@@ -850,6 +1405,7 @@ def load_session(sid: str):
     )
     st.session_state["current_session_id"] = sid
 
+
 def save_chat_history(sid: str):
     session_dir = os.path.join(SESSIONS_DIR, sid)
     with open(os.path.join(session_dir, "chat_history.json"), "w") as f:
@@ -864,6 +1420,7 @@ def save_chat_history(sid: str):
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
 
+
 def _save_file_meta(sid: str, filename: str, filetype: str):
     meta_path = os.path.join(SESSIONS_DIR, sid, "metadata.json")
     meta      = json.load(open(meta_path))
@@ -872,12 +1429,14 @@ def _save_file_meta(sid: str, filename: str, filetype: str):
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
 
+
 def rename_session(sid: str, new_name: str):
     meta_path    = os.path.join(SESSIONS_DIR, sid, "metadata.json")
     meta         = json.load(open(meta_path))
     meta["name"] = new_name
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
+
 
 def delete_session(sid: str):
     path = os.path.join(SESSIONS_DIR, sid)
@@ -892,9 +1451,11 @@ def delete_session(sid: str):
 def _generate_room_code() -> str:
     return "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
 
+
 def _safe_firebase_key(filename: str) -> str:
-    """Firebase keys cannot contain dots, slashes or spaces."""
+    """Firebase keys cannot contain dots, slashes, or spaces."""
     return filename.replace(".", "_").replace("/", "_").replace(" ", "_")
+
 
 def create_room(room_name: str) -> str:
     code     = _generate_room_code()
@@ -910,12 +1471,14 @@ def create_room(room_name: str) -> str:
     })
     return code
 
+
 def room_exists(code: str) -> bool:
     try:
         val = db.child("rooms").child(code).get().val()
         return val is not None and val.get("active", False)
     except:
         return False
+
 
 def get_room_messages(code: str) -> list:
     try:
@@ -929,12 +1492,15 @@ def get_room_messages(code: str) -> list:
         st.warning(f"{e}")
     return []
 
-def send_room_message(code: str, user: str, content: str,
-                      is_bot: bool = False, is_system: bool = False):
+
+def send_room_message(
+    code: str, user: str, content: str,
+    is_bot: bool = False, is_system: bool = False,
+):
     """
-    Send a message to the room.
-    is_bot    = True for LLM responses
-    is_system = True for notifications (file selection changes etc.)
+    Persist a message to the room on Firebase.
+    is_bot    = True for LLM responses.
+    is_system = True for notifications (file-selection changes etc.).
     """
     msg_id = str(uuid.uuid4())[:8]
     db.child("rooms").child(code).child("messages").child(msg_id).set({
@@ -944,6 +1510,7 @@ def send_room_message(code: str, user: str, content: str,
         "is_bot":    is_bot,
         "is_system": is_system,
     })
+
 
 def get_room_files(code: str) -> list:
     """Return real filenames from the room's Firebase file registry."""
@@ -964,10 +1531,12 @@ def get_room_file_registry(code: str) -> dict:
     except:
         return {}
 
+
 def _room_history_for_llm(code: str) -> list:
     """
-    FIX (room memory): Read Firebase room messages, strip system notifications,
-    and return a list of {"role", "content"} dicts for the LLM history param.
+    Fetch room messages from Firebase, strip system notifications, and
+    return the last HISTORY_WINDOW turns as {"role", "content"} dicts
+    for the LLM history parameter.
     """
     try:
         raw = get_room_messages(code)
@@ -977,22 +1546,23 @@ def _room_history_for_llm(code: str) -> list:
     for _, msg in raw:
         if msg.get("is_system"):
             continue
-        role = "assistant" if msg.get("is_bot") else "user"
+        role    = "assistant" if msg.get("is_bot") else "user"
         content = msg.get("content", "")
         if content:
             history.append({"role": role, "content": content})
-    return history
+    return history[-HISTORY_WINDOW:]
 
 
 def _add_file_to_room_db(code: str, filename: str, filetype: str):
     safe_key = _safe_firebase_key(filename)
     db.child("rooms").child(code).child("files").child(safe_key).set({
-        "type":        filetype,
-        "filename":    filename,
-        "uploaded_by": st.session_state["username"],
-        "uploaded_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "type":         filetype,
+        "filename":     filename,
+        "uploaded_by":  st.session_state["username"],
+        "uploaded_at":  datetime.now().strftime("%Y-%m-%d %H:%M"),
         "cloud_synced": False,
     })
+
 
 def get_all_rooms() -> dict:
     try:
@@ -1006,28 +1576,32 @@ def get_all_rooms() -> dict:
     except:
         return {}
 
+
 def delete_room(code: str):
     db.child("rooms").child(code).update({"active": False})
     room_dir = os.path.join(ROOMS_DIR, code)
     if os.path.exists(room_dir):
         shutil.rmtree(room_dir)
 
+
 def load_room_files_into_state(code: str):
     """
-    Called on every auto-refresh so files uploaded by the authorized
-    user become immediately available to all room members.
-    Also ensures room_selected_files defaults to all available files.
+    Called on every auto-refresh so files uploaded by the authorized user
+    become immediately available to all room members.
+
+    - Backfills older files to Firebase Storage if cloud_synced is False.
+    - Downloads files from Firebase Storage when the local index is missing.
+    - Tracks unavailable files that could not be loaded.
+    - Auto-selects all files for room querying by default.
     """
     room_files = get_room_file_registry(code)
 
     newly_loaded = []
-    unavailable = []
+    unavailable  = []
     for fname, meta in room_files.items():
         filetype = meta.get("type", "")
 
-        # Migration path: if this device already has a local copy/index for an
-        # older room file, backfill it to Firebase Storage so other devices can
-        # download it too.
+        # Backfill to Firebase Storage for older entries
         if not meta.get("cloud_synced"):
             _sync_room_file_to_cloud(code, fname, filetype)
 
@@ -1045,6 +1619,7 @@ def load_room_files_into_state(code: str):
                 newly_loaded.append(fname)
             else:
                 unavailable.append(fname)
+
         elif filetype == "image":
             img_path = _room_image_path(code, fname)
             if not os.path.exists(img_path):
@@ -1063,14 +1638,12 @@ def load_room_files_into_state(code: str):
         list(st.session_state["pdf_stores"].keys()) +
         list(st.session_state["image_files"].keys())
     )
-    st.session_state["selected_files"] = all_files
+    st.session_state["selected_files"]         = all_files
     st.session_state["room_unavailable_files"] = unavailable
 
-    # Auto-select all files for room querying by default
     if not st.session_state["room_selected_files"] and all_files:
         st.session_state["room_selected_files"] = all_files
     else:
-        # Add any newly loaded files to selection automatically
         for f in newly_loaded:
             if f not in st.session_state["room_selected_files"]:
                 st.session_state["room_selected_files"].append(f)
@@ -1082,6 +1655,7 @@ def load_room_files_into_state(code: str):
 
 with st.sidebar:
     st.title("🔒 AM Intelligence")
+    _render_gateway_model_selector()
     st.divider()
 
     # ── UNAUTHENTICATED ──────────────────────────────────────────────
@@ -1097,26 +1671,26 @@ with st.sidebar:
                 elif not room_exists(guest_code):
                     st.error("Room not found.")
                 else:
-                    st.session_state["mode"]               = "room"
-                    st.session_state["current_room_code"]  = guest_code
-                    st.session_state["username"]           = guest_name
-                    st.session_state["pdf_stores"]         = {}
-                    st.session_state["image_files"]        = {}
-                    st.session_state["selected_files"]     = []
-                    st.session_state["room_selected_files"]= []
+                    st.session_state["mode"]                   = "room"
+                    st.session_state["current_room_code"]      = guest_code
+                    st.session_state["username"]               = guest_name
+                    st.session_state["pdf_stores"]             = {}
+                    st.session_state["image_files"]            = {}
+                    st.session_state["selected_files"]         = []
+                    st.session_state["room_selected_files"]    = []
                     st.session_state["room_unavailable_files"] = []
                     st.rerun()
         else:
             st.info(f"👤 **{st.session_state['username']}** (Guest)")
             st.caption(f"Room: **{st.session_state['current_room_code']}**")
             if st.button("Leave Room", use_container_width=True):
-                st.session_state["mode"]               = "private"
-                st.session_state["current_room_code"]  = None
-                st.session_state["username"]           = ""
-                st.session_state["pdf_stores"]         = {}
-                st.session_state["image_files"]        = {}
-                st.session_state["selected_files"]     = []
-                st.session_state["room_selected_files"]= []
+                st.session_state["mode"]                   = "private"
+                st.session_state["current_room_code"]      = None
+                st.session_state["username"]               = ""
+                st.session_state["pdf_stores"]             = {}
+                st.session_state["image_files"]            = {}
+                st.session_state["selected_files"]         = []
+                st.session_state["room_selected_files"]    = []
                 st.session_state["room_unavailable_files"] = []
                 st.rerun()
 
@@ -1202,8 +1776,8 @@ with st.sidebar:
                     key=f"priv_uploader_{st.session_state['current_session_id']}",
                 )
                 if uploaded:
-                    sid       = st.session_state["current_session_id"]
-                    index_dir = os.path.join(SESSIONS_DIR, sid, "indexes")
+                    sid         = st.session_state["current_session_id"]
+                    index_dir   = os.path.join(SESSIONS_DIR, sid, "indexes")
                     current_sig = make_upload_signature(uploaded, sid)
                     if st.session_state["private_upload_sig"] != current_sig:
                         with st.spinner(f"Processing {uploaded.name}…"):
@@ -1246,11 +1820,11 @@ with st.sidebar:
                 r_name = st.text_input("Room name", key="cr_name")
                 if st.button("Create", use_container_width=True) and r_name:
                     code = create_room(r_name)
-                    st.session_state["current_room_code"]  = code
-                    st.session_state["pdf_stores"]         = {}
-                    st.session_state["image_files"]        = {}
-                    st.session_state["selected_files"]     = []
-                    st.session_state["room_selected_files"]= []
+                    st.session_state["current_room_code"]      = code
+                    st.session_state["pdf_stores"]             = {}
+                    st.session_state["image_files"]            = {}
+                    st.session_state["selected_files"]         = []
+                    st.session_state["room_selected_files"]    = []
                     st.session_state["room_unavailable_files"] = []
                     st.success(f"✅ Room created!  Code: **{code}**")
                     st.rerun()
@@ -1262,11 +1836,11 @@ with st.sidebar:
                 )
                 if st.button("Join", use_container_width=True, key="j_btn"):
                     if room_exists(j_code):
-                        st.session_state["current_room_code"]  = j_code
-                        st.session_state["pdf_stores"]         = {}
-                        st.session_state["image_files"]        = {}
-                        st.session_state["selected_files"]     = []
-                        st.session_state["room_selected_files"]= []
+                        st.session_state["current_room_code"]      = j_code
+                        st.session_state["pdf_stores"]             = {}
+                        st.session_state["image_files"]            = {}
+                        st.session_state["selected_files"]         = []
+                        st.session_state["room_selected_files"]    = []
                         st.session_state["room_unavailable_files"] = []
                         st.rerun()
                     else:
@@ -1286,11 +1860,11 @@ with st.sidebar:
                     with col1:
                         lbl = ("▶ " if is_active else "") + f"{data['name']} ({code})"
                         if st.button(lbl, key=f"r_{code}", use_container_width=True):
-                            st.session_state["current_room_code"]  = code
-                            st.session_state["pdf_stores"]         = {}
-                            st.session_state["image_files"]        = {}
-                            st.session_state["selected_files"]     = []
-                            st.session_state["room_selected_files"]= []
+                            st.session_state["current_room_code"]      = code
+                            st.session_state["pdf_stores"]             = {}
+                            st.session_state["image_files"]            = {}
+                            st.session_state["selected_files"]         = []
+                            st.session_state["room_selected_files"]    = []
                             st.session_state["room_unavailable_files"] = []
                             st.rerun()
                     with col2:
@@ -1314,8 +1888,8 @@ with st.sidebar:
                     key=f"room_uploader_{st.session_state['current_room_code']}",
                 )
                 if room_file:
-                    code      = st.session_state["current_room_code"]
-                    index_dir = os.path.join(ROOMS_DIR, code, "indexes")
+                    code        = st.session_state["current_room_code"]
+                    index_dir   = os.path.join(ROOMS_DIR, code, "indexes")
                     current_sig = make_upload_signature(room_file, code)
                     if st.session_state["room_upload_sig"] != current_sig:
                         with st.spinner(f"Processing {room_file.name}…"):
@@ -1356,10 +1930,9 @@ with st.sidebar:
                             key="room_file_multiselect",
                         )
 
-                    # Send notification if selection changed
                     new_selection = st.session_state["room_selected_files"]
                     if set(new_selection) != set(prev_selection) and new_selection:
-                        code = st.session_state["current_room_code"]
+                        code  = st.session_state["current_room_code"]
                         notif = (
                             f"📌 **{st.session_state['username']}** changed the active "
                             f"documents to: **{', '.join(new_selection)}**"
@@ -1377,6 +1950,7 @@ mode = st.session_state["mode"]
 if mode == "private":
 
     st.header("🔒 AM Intelligence")
+    st.caption(f"🤖 Model: {_current_gateway_model_status()}")
 
     if not st.session_state["authenticated"]:
         st.caption("💡 Log in from the sidebar to upload files and save sessions.")
@@ -1391,8 +1965,13 @@ if mode == "private":
             with st.chat_message("user"):
                 st.write(user_q)
             with st.spinner("Thinking…"):
-                response = ask_llm(user_q, has_context=False,
-                                   history=st.session_state["chat_history"])
+                try:
+                    response = ask_llm(
+                        user_q, has_context=False,
+                        history=st.session_state["chat_history"],
+                    )
+                except Exception as e:
+                    response = f"⚠️ Error getting response: {str(e)}"
             with st.chat_message("assistant"):
                 st.write(response)
             st.session_state["chat_history"].append({"role": "user",      "content": user_q})
@@ -1411,8 +1990,13 @@ if mode == "private":
             with st.chat_message("user"):
                 st.write(user_q)
             with st.spinner("Thinking…"):
-                response = ask_llm(user_q, has_context=False,
-                                   history=st.session_state["chat_history"])
+                try:
+                    response = ask_llm(
+                        user_q, has_context=False,
+                        history=st.session_state["chat_history"],
+                    )
+                except Exception as e:
+                    response = f"⚠️ Error getting response: {str(e)}"
             with st.chat_message("assistant"):
                 st.write(response)
             st.session_state["chat_history"].append({"role": "user",      "content": user_q})
@@ -1424,6 +2008,7 @@ if mode == "private":
         meta      = json.load(open(meta_path))
 
         st.header(f"💬 {meta['name']}")
+        st.caption(f"🤖 Model: {_current_gateway_model_status()}")
         st.caption(f"🕐 Created: {meta['created_at']}  ·  Last updated: {meta['updated_at']}")
 
         if st.session_state["selected_files"]:
@@ -1440,7 +2025,12 @@ if mode == "private":
             with st.chat_message("user"):
                 st.write(user_q)
             with st.spinner("Thinking…"):
-                response = build_response(user_q, history=st.session_state["chat_history"])
+                try:
+                    response = build_response(
+                        user_q, history=st.session_state["chat_history"]
+                    )
+                except Exception as e:
+                    response = f"⚠️ Error getting response: {str(e)}"
             with st.chat_message("assistant"):
                 st.write(response)
             st.session_state["chat_history"].append({"role": "user",      "content": user_q})
@@ -1459,16 +2049,14 @@ elif mode == "room":
             st.info("Enter a room code in the sidebar to join.")
 
     else:
-        # ── GHOST-RESPONSE FIX ─────────────────────────────────────────
-        # Read the chat input FIRST and immediately set room_thinking=True
-        # so that st_autorefresh is never armed in the same render as an
-        # active LLM call. Previously the autorefresh timer could fire
-        # mid-call, silently killing it and producing no bot response.
+        # Read chat input FIRST and set room_thinking=True immediately so that
+        # st_autorefresh is never armed in the same render as an active LLM
+        # call (which would silently kill it and produce no bot response).
         user_q = st.chat_input("Ask the room…")
         if user_q:
             st.session_state["room_thinking"] = True
 
-        # Pause auto-refresh while LLM is thinking so call isn't killed
+        # Pause auto-refresh while LLM is thinking
         if not st.session_state.get("room_thinking", False):
             st_autorefresh(interval=15000, key="room_refresh")
 
@@ -1493,10 +2081,12 @@ elif mode == "room":
             f"Created by: {room_data['created_by']}  ·  "
             f"{room_data['created_at']}"
         )
+        st.caption(f"🤖 Model: {_current_gateway_model_status()}")
 
         room_files = get_room_files(code)
         if room_files:
             st.caption(f"📂 Files in room: {', '.join(room_files)}")
+
         unavailable = st.session_state.get("room_unavailable_files", [])
         if unavailable:
             st.warning(
@@ -1504,7 +2094,6 @@ elif mode == "room":
                 f"could not load them yet: {', '.join(unavailable)}"
             )
 
-        # Show currently active query scope
         active = st.session_state.get("room_selected_files", [])
         if active and set(active) != set(room_files):
             st.caption(f"🔍 Currently querying: {', '.join(active)}")
@@ -1514,7 +2103,6 @@ elif mode == "room":
         # Render all messages from Firebase
         for _, msg in get_room_messages(code):
             if msg.get("is_system"):
-                # System notifications shown as info banners
                 st.info(msg.get("content", ""))
             else:
                 role = "assistant" if msg.get("is_bot") else "user"
@@ -1526,7 +2114,7 @@ elif mode == "room":
                         )
                     st.write(msg.get("content", ""))
 
-        # Chat input already read above — send message and get LLM response
+        # Process chat input already captured above
         if user_q:
             send_room_message(
                 code, st.session_state["username"], user_q, is_bot=False
@@ -1534,7 +2122,6 @@ elif mode == "room":
 
             with st.spinner("Thinking…"):
                 try:
-                    # FIX: pass room history so LLM has conversational memory
                     room_hist = _room_history_for_llm(code)
                     response  = build_response(user_q, history=room_hist)
                 except Exception as e:
